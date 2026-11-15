@@ -1,0 +1,33 @@
+[package]
+name = "luatools-downloads"
+description = "Download queue, jobs, progress accounting, and history"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+luatools-core = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# `blocking` is enabled here (not in the workspace table) because the queue runs
+# `Transfer` implementations on tokio's blocking pool, where a synchronous client
+# is the natural fit.
+reqwest = { workspace = true, features = ["blocking"] }
+tokio = { workspace = true }
+# `CancellationToken` lives behind the `rt` feature; the workspace enables `io`.
+tokio-util = { workspace = true, features = ["rt"] }
+tracing = { workspace = true }
+futures-util = { workspace = true }
+parking_lot = { workspace = true }
+chrono = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

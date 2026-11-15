@@ -1,0 +1,16 @@
+[package]
+name = "luatools-i18n"
+description = "Localized strings for the 29 LuaTools locales"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+luatools-core = { workspace = true }
+serde = { workspace = true }

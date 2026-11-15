@@ -1,0 +1,24 @@
+[package]
+name = "luatools-ui"
+description = "egui/eframe user interface: theme, widgets, and pages"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+luatools-core = { workspace = true }
+luatools-i18n = { workspace = true }
+egui = { workspace = true }
+eframe = { workspace = true }
+image = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+chrono = { workspace = true }

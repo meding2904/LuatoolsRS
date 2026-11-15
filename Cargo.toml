@@ -1,0 +1,77 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/luatools-core",
+    "crates/luatools-steam",
+    "crates/luatools-net",
+    "crates/luatools-downloads",
+    "crates/luatools-i18n",
+    "crates/luatools-ui",
+    "crates/luatools-app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+repository = "https://github.com/madoiscool/LuaTools"
+authors = ["LuaTools contributors"]
+
+[workspace.dependencies]
+luatools-core = { path = "crates/luatools-core" }
+luatools-steam = { path = "crates/luatools-steam" }
+luatools-net = { path = "crates/luatools-net" }
+luatools-downloads = { path = "crates/luatools-downloads" }
+luatools-i18n = { path = "crates/luatools-i18n" }
+luatools-ui = { path = "crates/luatools-ui" }
+
+anyhow = "1.0"
+axum = "0.8"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+directories = "6.0"
+eframe = { version = "0.37", default-features = false, features = ["wgpu", "glow", "default_fonts", "x11", "wayland", "persistence"] }
+egui = "0.37"
+futures-util = "0.3"
+hex = "0.4"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+indexmap = { version = "2.7", features = ["serde"] }
+parking_lot = "0.12"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "gzip", "stream", "http2"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+tempfile = "3.14"
+thiserror = "2.0"
+tokio = { version = "1.42", features = ["rt-multi-thread", "macros", "fs", "io-util", "sync", "time", "process", "signal"] }
+tokio-util = { version = "0.7", features = ["io"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2.5"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+missing_docs = "warn"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+correctness = { level = "deny", priority = -1 }
+suspicious = { level = "warn", priority = -1 }
+style = { level = "warn", priority = -1 }
+complexity = { level = "warn", priority = -1 }
+perf = { level = "warn", priority = -1 }
+unwrap_used = "warn"
+expect_used = "warn"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+
+[profile.dev]
+opt-level = 0
+debug = true
+
+[profile.dev.package."*"]
+opt-level = 3
