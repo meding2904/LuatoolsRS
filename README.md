@@ -36,6 +36,7 @@ These are rendered by the real UI code through offscreen wgpu, not mockups.
 | Steam store search / app metadata client | implemented, not surfaced in the UI yet |
 | Multi-language UI (English + 29 translations) | working |
 | Settings, cache, atomic persistence, single instance, protocol handoff | working |
+| Startup library scan | automatic; manual refresh also available |
 | Updater check (GitHub releases) | check only; installation is package-manager work |
 | Millennium/Steam store plugin installer | trait + server surface; platform installer not implemented |
 | Local plugin API server | loopback + token, three routes |

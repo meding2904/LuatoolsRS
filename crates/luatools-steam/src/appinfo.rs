@@ -155,8 +155,15 @@ impl SteamAppEntry {
     /// Extracts the UI-facing fields from an appinfo body.
     #[must_use]
     pub fn from_body(app_id: AppId, body: &Bvdf) -> Self {
-        let name = body.get_text("name").unwrap_or_default();
-        let app_type = AppType::from_tag(body.get_text("type").as_deref().unwrap_or_default());
+        // Steam keeps the descriptive fields in `common` (current appinfo) or `appinfo` (older
+        // captures); the launch entries live in `config`. Fall back to the record root for
+        // hand-built blobs.
+        let app = body
+            .get_table("common")
+            .or_else(|| body.get_table("appinfo"))
+            .unwrap_or(body);
+        let name = app.get_text("name").unwrap_or_default();
+        let app_type = AppType::from_tag(app.get_text("type").as_deref().unwrap_or_default());
         Self {
             app_id,
             name,
@@ -787,5 +794,17 @@ mod tests {
         assert_eq!(AppType::from_tag("something-new"), AppType::Unknown);
         assert_eq!(AppType::Game.as_str(), "game");
         assert_eq!(AppType::Unknown.as_str(), "");
+    }
+
+    #[test]
+    fn reads_name_from_the_common_table() {
+        let mut common = Bvdf::new();
+        common.push_text("name", "Counter-Strike 2");
+        common.push_text("type", "Game");
+        let mut body = Bvdf::new();
+        body.push_table("common", common);
+        let entry = SteamAppEntry::from_body(AppId::new(730), &body);
+        assert_eq!(entry.name, "Counter-Strike 2");
+        assert_eq!(entry.app_type, AppType::Game);
     }
 }

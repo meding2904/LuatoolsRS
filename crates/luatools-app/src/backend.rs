@@ -347,36 +347,30 @@ async fn run(
         handle_url(&url, &events);
     }
 
+    refresh_library(&mut steam, &settings, &events);
+    if settings.check_updates {
+        let events = events.clone();
+        tokio::spawn(async move {
+            if let Some(release) = update_check(&events).await {
+                let current = env!("CARGO_PKG_VERSION").to_owned();
+                let state = release.map_or(
+                    UpdateState::UpToDate {
+                        current: current.clone(),
+                    },
+                    |release| UpdateState::Available {
+                        current,
+                        latest: release.version,
+                        notes: release.notes,
+                    },
+                );
+                let _ = events.send(Event::UpdateState(state));
+            }
+        });
+    }
+
     while let Some(command) = commands.recv().await {
         match command {
-            Command::RefreshLibrary => {
-                let _ = events.send(Event::Busy {
-                    key: "library",
-                    active: true,
-                });
-                let started = std::time::Instant::now();
-                let result = steam.rescan(settings.steam_path.as_deref());
-                let _ = events.send(Event::Busy {
-                    key: "library",
-                    active: false,
-                });
-                match result {
-                    Ok(snapshot) => {
-                        tracing::info!(
-                            apps = snapshot.apps.len(),
-                            ms = started.elapsed().as_millis(),
-                            "library scanned"
-                        );
-                        let _ = events.send(Event::LibraryRefreshed(Box::new(snapshot)));
-                    }
-                    Err(error) => {
-                        let _ = events.send(Event::Error {
-                            context: "refresh library".to_owned(),
-                            message: error.to_string(),
-                        });
-                    }
-                }
-            }
+            Command::RefreshLibrary => refresh_library(&mut steam, &settings, &events),
             Command::LoadAppDetails(app_id) => {
                 if steam.libraries.is_empty()
                     && let Ok(snapshot) = steam.rescan(settings.steam_path.as_deref())
@@ -597,6 +591,35 @@ async fn update_check(
                 reason: error.to_string(),
             }));
             None
+        }
+    }
+}
+
+fn refresh_library(steam: &mut SteamState, settings: &Settings, events: &UnboundedSender<Event>) {
+    let _ = events.send(Event::Busy {
+        key: "library",
+        active: true,
+    });
+    let started = std::time::Instant::now();
+    let result = steam.rescan(settings.steam_path.as_deref());
+    let _ = events.send(Event::Busy {
+        key: "library",
+        active: false,
+    });
+    match result {
+        Ok(snapshot) => {
+            tracing::info!(
+                apps = snapshot.apps.len(),
+                ms = started.elapsed().as_millis(),
+                "library scanned"
+            );
+            let _ = events.send(Event::LibraryRefreshed(Box::new(snapshot)));
+        }
+        Err(error) => {
+            let _ = events.send(Event::Error {
+                context: "refresh library".to_owned(),
+                message: error.to_string(),
+            });
         }
     }
 }
