@@ -17,8 +17,9 @@ use luatools_net::http::{HttpClientConfig, build as build_http};
 use luatools_net::plugin::{PluginInstaller, UnsupportedPluginInstaller};
 use luatools_net::update::GitHubReleases;
 use luatools_steam::{
-    AppInfoCache, LaunchModStore, LaunchOption, SteamLibrary, discover_libraries, find_steam_root,
-    parse_steam_link, read_launch_options,
+    AppInfoCache, LaunchModStore, LaunchOption, SteamLibrary, apply_launch_options,
+    discover_libraries, find_steam_root, parse_steam_link, read_launch_options,
+    read_user_launch_options,
 };
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
@@ -188,6 +189,12 @@ impl SteamState {
         })?;
 
         let (launch_options, depots) = self.read_app_metadata(app_id);
+        let launch_options = self
+            .root
+            .as_deref()
+            .and_then(luatools_steam::active_localconfig)
+            .and_then(|path| read_user_launch_options(&path, app_id).ok().flatten())
+            .unwrap_or(launch_options);
         Some(AppDetails {
             app,
             depots,
@@ -400,6 +407,9 @@ async fn run(
                 }
             }
             Command::SaveLaunchOptions { app_id, options } => {
+                if steam.root.is_none() {
+                    steam.root = find_steam_root(settings.steam_path.as_deref());
+                }
                 let original = steam
                     .appinfo
                     .as_mut()
@@ -408,11 +418,32 @@ async fn run(
                     .map(|body| read_launch_options(&body))
                     .unwrap_or_default();
                 let parsed = parse_launch_options_text(&options, &original);
-                match mod_store.stage_with_original(app_id, &parsed, &original) {
-                    Ok(()) => {
+                let staged = mod_store.stage_with_original(app_id, &parsed, &original);
+                let applied = match (&staged, steam.root.as_deref()) {
+                    (Ok(()), Some(root)) => apply_launch_options(root, app_id, &options),
+                    _ => Ok(None),
+                };
+                match (staged, applied) {
+                    (Ok(()), Ok(Some(_))) => {
                         let _ = events.send(Event::LaunchOptionsSaved(app_id));
+                        let _ = events.send(Event::Toast(Toast::success(
+                            "Launch options written; restart Steam to apply them",
+                        )));
                     }
-                    Err(error) => {
+                    (Ok(()), Ok(None)) => {
+                        let _ = events.send(Event::LaunchOptionsSaved(app_id));
+                        let _ = events.send(Event::Toast(Toast::info(
+                            "Launch options staged; no Steam account config was found",
+                        )));
+                    }
+                    (Ok(()), Err(error)) => {
+                        let _ = events.send(Event::LaunchOptionsSaved(app_id));
+                        let _ = events.send(Event::Error {
+                            context: "apply launch options".to_owned(),
+                            message: error.to_string(),
+                        });
+                    }
+                    (Err(error), _) => {
                         let _ = events.send(Event::Error {
                             context: "save launch options".to_owned(),
                             message: error.to_string(),
@@ -461,6 +492,31 @@ async fn run(
             Command::OpenUrl(url) => report(platform::open_url(&url), "open url", &events),
             Command::LaunchApp(app_id) => {
                 report(platform::launch_steam_app(app_id.get()), "launch", &events);
+            }
+            Command::InstallApp(app_id) => {
+                report(
+                    platform::install_steam_app(app_id.get()),
+                    "install",
+                    &events,
+                );
+            }
+            Command::OpenStorePage(app_id) => {
+                report(
+                    platform::open_store_page(app_id.get()),
+                    "store page",
+                    &events,
+                );
+            }
+            Command::RestartSteam => {
+                let _ = events.send(Event::Busy {
+                    key: "steam",
+                    active: true,
+                });
+                report(platform::restart_steam(), "restart steam", &events);
+                let _ = events.send(Event::Busy {
+                    key: "steam",
+                    active: false,
+                });
             }
             Command::CheckForUpdates => {
                 let _ = events.send(Event::UpdateState(UpdateState::Checking));

@@ -1,6 +1,8 @@
 //! Settings.
 
 use eframe::egui::{self, Align, Label, Layout, RichText};
+use std::path::PathBuf;
+
 use luatools_core::{Command, DownloadScheduling, Locale, Settings, ThemePreference};
 use luatools_i18n::Key;
 
@@ -15,6 +17,10 @@ pub struct State {
     pub draft: Option<Settings>,
     /// Whether the draft differs from what is active.
     pub dirty: bool,
+    /// Pending native folder picker for the download directory.
+    pub download_picker: Option<std::sync::mpsc::Receiver<Option<PathBuf>>>,
+    /// Pending native folder picker for the Steam root.
+    pub steam_picker: Option<std::sync::mpsc::Receiver<Option<PathBuf>>>,
 }
 
 impl State {
@@ -43,6 +49,19 @@ pub fn show(ui: &mut egui::Ui, app: &mut AppState, state: &mut State) {
 
     let mut save = false;
     let mut reset = false;
+    let mut pick_download = false;
+    let mut pick_steam = false;
+
+    if let Some(result) = crate::dialogs::poll(&mut state.download_picker)
+        && let Some(path) = result
+    {
+        state.draft_mut(&current).download_dir = path;
+    }
+    if let Some(result) = crate::dialogs::poll(&mut state.steam_picker)
+        && let Some(path) = result
+    {
+        state.draft_mut(&current).steam_path = Some(path);
+    }
 
     // Leave room for the action bar below the scroll area.
     let scroll_height = (ui.available_height() - 80.0).max(160.0);
@@ -53,7 +72,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut AppState, state: &mut State) {
 
             section(ui, &theme, "GENERAL", |ui| {
                 ui.horizontal(|ui| {
-                    let label = field_label(ui, &theme, "Language");
+                    field_label(ui, &theme, "Language");
                     let combo = egui::ComboBox::from_id_salt("settings-language")
                         .selected_text(draft.language.native_name())
                         .show_ui(ui, |ui| {
@@ -65,7 +84,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut AppState, state: &mut State) {
                                 );
                             }
                         });
-                    label.labelled_by(combo.response.id);
+                    label_widget(ui, combo.response.id, "Language");
                 });
                 hint(ui, &theme, "Applies to every screen.");
                 row_divider(ui, &theme);
@@ -96,15 +115,10 @@ pub fn show(ui: &mut egui::Ui, app: &mut AppState, state: &mut State) {
                 );
                 ui.horizontal(|ui| {
                     ui.add_space(150.0 + theme.gap);
-                    let response = ui
-                        .add_enabled_ui(false, |ui| {
-                            widgets::secondary_button(ui, &theme, "Choose…")
-                        })
-                        .inner;
-                    response.on_disabled_hover_text(
-                        "The folder picker is not wired up in this build yet.",
-                    );
-                    hint(ui, &theme, "Folder selection arrives with the backend.");
+                    if widgets::secondary_button(ui, &theme, "Choose…").clicked() {
+                        pick_download = true;
+                    }
+                    hint(ui, &theme, "New downloads are written here.");
                 });
                 row_divider(ui, &theme);
 
@@ -161,20 +175,56 @@ pub fn show(ui: &mut egui::Ui, app: &mut AppState, state: &mut State) {
                 row_divider(ui, &theme);
 
                 ui.horizontal(|ui| {
-                    let label = field_label(ui, &theme, "Local API port");
+                    field_label(ui, &theme, "Local API port");
                     let drag = ui.add(
                         egui::DragValue::new(&mut draft.local_api_port)
                             .range(0..=65535)
                             .speed(1.0),
                     );
-                    label.labelled_by(drag.id);
+                    label_widget(ui, drag.id, "Local API port");
                 });
                 hint(ui, &theme, "0 picks a free port.");
+                row_divider(ui, &theme);
+
+                let detected = app.snapshot.steam_root.as_ref().map_or_else(
+                    || "not detected".to_owned(),
+                    |path| path.display().to_string(),
+                );
+                let steam_path = draft
+                    .steam_path
+                    .as_ref()
+                    .map_or_else(|| detected.clone(), |path| path.display().to_string());
+                ui.horizontal(|ui| {
+                    field_label(ui, &theme, "Steam folder");
+                    ui.label(egui::RichText::new(steam_path).color(theme.muted));
+                    if widgets::secondary_button(ui, &theme, "Choose…").clicked() {
+                        pick_steam = true;
+                    }
+                    if draft.steam_path.is_some()
+                        && widgets::link_button(ui, &theme, "Reset to auto").clicked()
+                    {
+                        draft.steam_path = None;
+                    }
+                });
+                hint(ui, &theme, "Auto-detected from Steam's install locations.");
                 row_divider(ui, &theme);
 
                 ui.checkbox(&mut draft.plugin_enabled, "Install the Steam store plugin");
             });
         });
+
+    if pick_download {
+        let initial = state.draft.as_ref().map(|draft| draft.download_dir.clone());
+        state.download_picker = Some(crate::dialogs::pick_folder(initial));
+    }
+    if pick_steam {
+        let initial = state
+            .draft
+            .as_ref()
+            .and_then(|draft| draft.steam_path.clone())
+            .or_else(|| app.snapshot.steam_root.clone());
+        state.steam_picker = Some(crate::dialogs::pick_folder(initial));
+    }
 
     state.dirty = save_enabled(state.draft.as_ref(), &current);
     let can_save = state.dirty;
@@ -247,6 +297,12 @@ fn field_label(ui: &mut egui::Ui, theme: &Theme, text: &str) -> eframe::egui::Re
                 .color(theme.muted),
         ),
     )
+}
+
+/// Sets an explicit accessible name on a widget.
+fn label_widget(ui: &egui::Ui, id: egui::Id, name: &str) {
+    ui.ctx()
+        .accesskit_node_builder(id, |node| node.set_label(name));
 }
 
 /// A muted explanatory line.

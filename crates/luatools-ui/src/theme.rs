@@ -125,6 +125,7 @@ impl Theme {
 
     /// Installs colours, spacing, and text styles on the context.
     pub fn install(&self, ctx: &Context, dark_mode: bool) {
+        install_fonts(ctx);
         ctx.set_theme(if dark_mode {
             egui::ThemePreference::Dark
         } else {
@@ -230,6 +231,75 @@ impl Theme {
             Tone::Text => self.text,
         }
     }
+}
+
+/// Installs system fallback fonts once per process.
+///
+/// egui's bundled fonts cover Latin, Greek, Cyrillic and emoji but not CJK or Arabic, so the
+/// 29 shipped locales would render as boxes without these. Files are loaded from well-known
+/// OS locations; a missing font is not an error, the text simply falls back to the default.
+pub fn install_fonts(ctx: &Context) {
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static INSTALLED: OnceLock<()> = OnceLock::new();
+    static WARNED: AtomicBool = AtomicBool::new(false);
+
+    INSTALLED.get_or_init(|| {
+        for (name, candidates) in [
+            (
+                "system-cjk",
+                &[
+                    "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+                    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+                    "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+                    "C:/Windows/Fonts/msyh.ttc",
+                    "C:/Windows/Fonts/simsun.ttc",
+                    "/System/Library/Fonts/PingFang.ttc",
+                ][..],
+            ),
+            (
+                "system-thai",
+                &[
+                    "/usr/share/fonts/noto/NotoSansThai-Regular.ttf",
+                    "/usr/share/fonts/truetype/noto/NotoSansThai-Regular.ttf",
+                    "C:/Windows/Fonts/leelawui.ttf",
+                    "/System/Library/Fonts/Thonburi.ttc",
+                ][..],
+            ),
+            (
+                "system-arabic",
+                &[
+                    "/usr/share/fonts/noto/NotoKufiArabic-Regular.ttf",
+                    "/usr/share/fonts/noto/NotoSansArabicUI-Regular.ttf",
+                    "/usr/share/fonts/truetype/noto/NotoSansArabic-Regular.ttf",
+                    "C:/Windows/Fonts/segoeui.ttf",
+                    "/System/Library/Fonts/GeezaPro.ttc",
+                ][..],
+            ),
+        ] {
+            let Some(bytes) = candidates.iter().find_map(|path| std::fs::read(path).ok()) else {
+                if !WARNED.swap(true, Ordering::Relaxed) {
+                    tracing::debug!(name, "no system fallback font found");
+                }
+                continue;
+            };
+            ctx.add_font(egui::FontInsert::new(
+                name,
+                egui::FontData::from_owned(bytes),
+                vec![
+                    egui::epaint::text::InsertFontFamily {
+                        family: FontFamily::Proportional,
+                        priority: egui::epaint::text::FontPriority::Lowest,
+                    },
+                    egui::epaint::text::InsertFontFamily {
+                        family: FontFamily::Monospace,
+                        priority: egui::epaint::text::FontPriority::Lowest,
+                    },
+                ],
+            ));
+        }
+    });
 }
 
 /// Semantic colours used by widgets and status rows.

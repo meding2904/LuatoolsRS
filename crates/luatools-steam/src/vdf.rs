@@ -102,6 +102,52 @@ impl Vdf {
         self.insert(key, VdfValue::Object(value));
     }
 
+    /// Returns a mutable entry by key, compared ASCII case-insensitively.
+    pub fn get_key_mut(&mut self, key: &str) -> Option<&mut VdfValue> {
+        self.entries
+            .iter_mut()
+            .find(|(candidate, _)| candidate.eq_ignore_ascii_case(key))
+            .map(|(_, value)| value)
+    }
+
+    /// Returns the nested object at `path`, creating missing levels as needed.
+    ///
+    /// Existing keys are matched case-insensitively and keep their original spelling, so
+    /// editing a real Steam file does not rewrite unrelated key casing.
+    pub fn obtain_table(&mut self, path: &str) -> &mut Vdf {
+        let mut current = self;
+        for key in path.split('.').filter(|segment| !segment.is_empty()) {
+            let existing = current
+                .entries
+                .keys()
+                .find(|candidate| candidate.eq_ignore_ascii_case(key))
+                .cloned();
+            let key = existing.unwrap_or_else(|| key.to_owned());
+            let value = current
+                .entries
+                .entry(key)
+                .or_insert_with(|| VdfValue::Object(Vdf::new()));
+            if !matches!(value, VdfValue::Object(_)) {
+                *value = VdfValue::Object(Vdf::new());
+            }
+            current = match value {
+                VdfValue::Object(table) => table,
+                VdfValue::String(_) => unreachable!("value was just replaced with a table"),
+            };
+        }
+        current
+    }
+
+    /// Removes an entry by key, returning the previous value.
+    pub fn remove_key(&mut self, key: &str) -> Option<VdfValue> {
+        let existing = self
+            .entries
+            .keys()
+            .find(|candidate| candidate.eq_ignore_ascii_case(key))
+            .cloned();
+        existing.and_then(|key| self.entries.shift_remove(&key))
+    }
+
     /// Returns an entry by exact key, compared ASCII case-insensitively.
     #[must_use]
     pub fn get_key(&self, key: &str) -> Option<&VdfValue> {

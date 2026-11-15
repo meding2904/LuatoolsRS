@@ -70,6 +70,8 @@ impl Step {
 pub struct State {
     /// Current step.
     pub step: Step,
+    /// Pending native folder picker for the Steam root.
+    pub steam_picker: Option<std::sync::mpsc::Receiver<Option<std::path::PathBuf>>>,
 }
 
 /// Renders onboarding full-screen. The shell decides when to show it.
@@ -194,7 +196,22 @@ fn step_body(ui: &mut egui::Ui, app: &mut AppState, state: &mut State, theme: &T
                 } else if widgets::secondary_button(ui, theme, "Scan now").clicked() {
                     app.send(Command::RefreshLibrary);
                 }
+                if widgets::secondary_button(ui, theme, "Choose folder…").clicked() {
+                    state.steam_picker = Some(crate::dialogs::pick_folder(
+                        app.settings
+                            .steam_path
+                            .clone()
+                            .or_else(|| app.snapshot.steam_root.clone()),
+                    ));
+                }
             });
+            if let Some(result) = crate::dialogs::poll(&mut state.steam_picker)
+                && let Some(path) = result
+            {
+                app.settings.steam_path = Some(path);
+                app.save_settings();
+                app.send(Command::RefreshLibrary);
+            }
             ui.add_space(8.0);
             ui.label(
                 RichText::new(
@@ -324,7 +341,10 @@ mod tests {
         app.snapshot.steam_root = Some(PathBuf::from("/steam"));
         let ctx = egui::Context::default();
         for step in Step::ALL {
-            let mut state = State { step };
+            let mut state = State {
+                step,
+                ..State::default()
+            };
             let mut output = ctx.run_ui(Default::default(), |ui| show(ui, &mut app, &mut state));
             // No renderer consumes the texture delta in a headless pass.
             output.textures_delta.clear();

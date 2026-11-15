@@ -17,6 +17,7 @@ luatools-i18n = { workspace = true }
 egui = { workspace = true }
 eframe = { workspace = true }
 image = { workspace = true }
+rfd = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
 

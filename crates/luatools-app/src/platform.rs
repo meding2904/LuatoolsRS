@@ -62,6 +62,60 @@ pub fn launch_steam_app(app_id: u32) -> Result<()> {
     open_path(Path::new(&url))
 }
 
+/// Asks Steam to install or update an app.
+///
+/// # Errors
+///
+/// Returns [`Error::Unsupported`] when the platform has no protocol handler.
+pub fn install_steam_app(app_id: u32) -> Result<()> {
+    open_steam_url(&format!("steam://install/{app_id}"))
+}
+
+/// Opens an app's Steam store page.
+///
+/// # Errors
+///
+/// Returns [`Error::Unsupported`] when the platform has no protocol handler.
+pub fn open_store_page(app_id: u32) -> Result<()> {
+    open_steam_url(&format!("steam://store/{app_id}"))
+}
+
+/// Closes Steam and relaunches it.
+///
+/// Launch options written to `localconfig.vdf` are only read when the client starts, so the
+/// user must restart Steam for them to take effect.
+///
+/// # Errors
+///
+/// Returns [`Error::Other`] when the Steam binary cannot be found or started.
+pub fn restart_steam() -> Result<()> {
+    let steam = if cfg!(target_os = "windows") {
+        "steam.exe"
+    } else {
+        "steam"
+    };
+    // Best effort shutdown; Steam may not be running.
+    let _ = Command::new(steam).arg("-shutdown").status();
+    Command::new(steam)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| Error::Other(format!("starting {steam}: {e}")))
+}
+
+fn open_steam_url(url: &str) -> Result<()> {
+    if cfg!(target_os = "windows") {
+        return spawn(
+            "cmd",
+            &[
+                std::ffi::OsStr::new("/C"),
+                std::ffi::OsStr::new("start"),
+                std::ffi::OsStr::new(url),
+            ],
+        );
+    }
+    open_path(Path::new(url))
+}
+
 /// Opens a URL in the default browser.
 ///
 /// # Errors

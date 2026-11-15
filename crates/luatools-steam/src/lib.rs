@@ -25,6 +25,7 @@ pub mod covers;
 pub mod launch_options;
 pub mod library;
 pub mod links;
+pub mod localconfig;
 pub mod manifest;
 pub mod vdf;
 
@@ -37,5 +38,9 @@ pub use launch_options::{
 };
 pub use library::{SteamLibrary, discover_libraries, find_steam_root, installed_size};
 pub use links::{MAX_APP_ID, SteamLink, extract_app_id, parse_steam_link};
+pub use localconfig::{
+    active_localconfig, apply_launch_options, localconfig_paths,
+    read_launch_options as read_user_launch_options, write_launch_options,
+};
 pub use manifest::{Manifest, ManifestFile, matches, parse_manifest};
 pub use vdf::{Vdf, VdfValue, parse as parse_vdf, parse_file, to_string_pretty};

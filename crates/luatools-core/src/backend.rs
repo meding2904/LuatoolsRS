@@ -157,6 +157,12 @@ pub enum Command {
     RevealPath(PathBuf),
     /// Start a game through the Steam client.
     LaunchApp(AppId),
+    /// Ask Steam to install or update an app (`steam://install/<id>`).
+    InstallApp(AppId),
+    /// Open the Steam store page for an app.
+    OpenStorePage(AppId),
+    /// Close and relaunch the Steam client.
+    RestartSteam,
     /// Add a download job.
     EnqueueDownload(Box<DownloadRequest>),
     /// Temporarily stop a running job.

@@ -93,6 +93,8 @@ pub fn show(ui: &mut egui::Ui, app: &mut AppState, state: &mut State) {
     let mut reveal = false;
     let mut launch = false;
     let mut launch_options = false;
+    let mut install = false;
+    let mut store = false;
 
     egui::ScrollArea::vertical()
         .id_salt("manage-body")
@@ -176,6 +178,12 @@ pub fn show(ui: &mut egui::Ui, app: &mut AppState, state: &mut State) {
                     if widgets::secondary_button(ui, &theme, "Launch").clicked() {
                         launch = true;
                     }
+                    if widgets::secondary_button(ui, &theme, "Install in Steam").clicked() {
+                        install = true;
+                    }
+                    if widgets::link_button(ui, &theme, "Store page").clicked() {
+                        store = true;
+                    }
                 });
             });
 
@@ -222,6 +230,12 @@ pub fn show(ui: &mut egui::Ui, app: &mut AppState, state: &mut State) {
     }
     if launch {
         app.send(Command::LaunchApp(app_id));
+    }
+    if install {
+        app.send(Command::InstallApp(app_id));
+    }
+    if store {
+        app.send(Command::OpenStorePage(app_id));
     }
     ui.add_space(8.0);
 }

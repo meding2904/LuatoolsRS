@@ -7,6 +7,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod app;
+pub mod dialogs;
 pub mod pages;
 pub mod state;
 pub mod theme;
