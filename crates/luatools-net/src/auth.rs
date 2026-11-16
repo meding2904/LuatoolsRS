@@ -6,11 +6,14 @@
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use luatools_core::{Error, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use tokio_util::sync::CancellationToken;
 
 /// Length of the random verifier in bytes. Base64url expands this to 64 characters.
 const VERIFIER_BYTES: usize = 48;
@@ -148,6 +151,340 @@ impl Session {
             .as_deref()
             .is_some_and(|token| !token.is_empty())
     }
+}
+
+/// Connection details for a Supabase-compatible authentication service.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthConfig {
+    /// Service origin, without a trailing slash.
+    pub base_url: String,
+    /// Public anon key sent as the `apikey` header.
+    pub anon_key: String,
+    /// Local callback port registered with the provider.
+    pub callback_port: u16,
+}
+
+impl AuthConfig {
+    /// Reads the deployment from environment variables.
+    ///
+    /// Returns `None` when either `LUATOOLS_SUPABASE_URL` or
+    /// `LUATOOLS_SUPABASE_ANON_KEY` is absent or empty. `LUATOOLS_OAUTH_CALLBACK_PORT`
+    /// overrides the default callback port.
+    #[must_use]
+    pub fn from_env() -> Option<Self> {
+        let base_url = std::env::var("LUATOOLS_SUPABASE_URL")
+            .ok()
+            .filter(|value| !value.trim().is_empty())?;
+        let anon_key = std::env::var("LUATOOLS_SUPABASE_ANON_KEY")
+            .ok()
+            .filter(|value| !value.trim().is_empty())?;
+        let callback_port = std::env::var("LUATOOLS_OAUTH_CALLBACK_PORT")
+            .ok()
+            .and_then(|value| value.trim().parse::<u16>().ok())
+            .filter(|port| *port > 0)
+            .unwrap_or(53_789);
+        Some(Self {
+            base_url: base_url.trim_end_matches('/').to_owned(),
+            anon_key,
+            callback_port,
+        })
+    }
+
+    /// The redirect URL the provider must call back.
+    #[must_use]
+    pub fn callback_url(&self) -> String {
+        format!("http://localhost:{}/callback", self.callback_port)
+    }
+}
+
+/// Interactive and refresh-token authentication against Supabase.
+#[derive(Debug, Clone)]
+pub struct AuthClient {
+    client: reqwest::Client,
+    config: AuthConfig,
+}
+
+impl AuthClient {
+    /// Builds a client.
+    #[must_use]
+    pub fn new(client: reqwest::Client, config: AuthConfig) -> Self {
+        Self { client, config }
+    }
+
+    /// The configured service.
+    #[must_use]
+    pub fn config(&self) -> &AuthConfig {
+        &self.config
+    }
+
+    /// Builds the browser authorization URL for a PKCE challenge.
+    #[must_use]
+    pub fn authorize_url(&self, challenge: &str) -> String {
+        let callback = url::form_urlencoded::byte_serialize(self.config.callback_url().as_bytes())
+            .collect::<String>();
+        format!(
+            "{}/auth/v1/authorize?provider=discord&redirect_to={callback}&code_challenge={challenge}&code_challenge_method=s256",
+            self.config.base_url
+        )
+    }
+
+    /// Waits for the local callback and returns its `code` query parameter.
+    ///
+    /// Binds `127.0.0.1:callback_port`. Requests without a `code` or `error_description` are
+    /// answered with 404 and ignored, matching the original flow.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Io`] when the callback port cannot be bound, [`Error::Cancelled`] when
+    /// `cancel` fires, [`Error::Other`] when the provider reports an error, and a timeout error
+    /// after `timeout` elapses.
+    pub async fn wait_for_code(
+        &self,
+        timeout: Duration,
+        cancel: CancellationToken,
+    ) -> Result<String> {
+        let address = std::net::SocketAddr::from(([127, 0, 0, 1], self.config.callback_port));
+        let listener = tokio::net::TcpListener::bind(address)
+            .await
+            .map_err(|error| Error::io(format!("binding {address}"), error))?;
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let accept = tokio::select! {
+                _ = cancel.cancelled() => return Err(Error::Cancelled),
+                result = tokio::time::timeout_at(deadline, listener.accept()) => result,
+            };
+            let (mut socket, _) = match accept {
+                Ok(Ok(connection)) => connection,
+                Ok(Err(error)) => {
+                    return Err(Error::io("accepting OAuth callback".to_owned(), error));
+                }
+                Err(_) => {
+                    return Err(Error::Other("sign-in timed out".to_owned()));
+                }
+            };
+
+            let mut buffer = vec![0_u8; 8192];
+            let read = tokio::time::timeout(Duration::from_secs(5), socket.read(&mut buffer))
+                .await
+                .map_err(|_| Error::Other("OAuth callback read timed out".to_owned()))?;
+            let read = match read {
+                Ok(read) => read,
+                Err(error) => {
+                    tracing::debug!(%error, "OAuth callback read failed");
+                    continue;
+                }
+            };
+            let request = String::from_utf8_lossy(&buffer[..read]);
+            let path = request
+                .lines()
+                .next()
+                .and_then(|line| line.split_whitespace().nth(1))
+                .unwrap_or("/");
+            let parsed = url::Url::parse(&format!("http://localhost{path}")).ok();
+            let Some(parsed) = parsed else {
+                let _ = write_callback_response(&mut socket, 400, "Invalid callback").await;
+                continue;
+            };
+            let query: Vec<(String, String)> =
+                url::form_urlencoded::parse(parsed.query().unwrap_or_default().as_bytes())
+                    .into_owned()
+                    .collect();
+            let code = query
+                .iter()
+                .find(|(key, _)| key == "code")
+                .map(|(_, value)| value.clone());
+            let error = query
+                .iter()
+                .find(|(key, _)| key == "error_description" || key == "error")
+                .map(|(_, value)| value.clone());
+            if let Some(code) = code {
+                let _ = write_callback_response(
+                    &mut socket,
+                    200,
+                    "Sign-in complete. You can close this tab.",
+                )
+                .await;
+                return Ok(code);
+            }
+            if let Some(error) = error {
+                let message = format!("Sign-in was denied: {error}");
+                let _ = write_callback_response(&mut socket, 200, &message).await;
+                return Err(Error::Other(message));
+            }
+            let _ = write_callback_response(&mut socket, 404, "Not found").await;
+        }
+    }
+
+    /// Exchanges an authorization code for a session.
+    ///
+    /// # Errors
+    ///
+    /// Returns a network, HTTP, or parse error.
+    pub async fn exchange_code(&self, code: &str, verifier: &str) -> Result<Session> {
+        let body = serde_json::json!({
+            "auth_code": code,
+            "code_verifier": verifier,
+        });
+        let response = self
+            .client
+            .post(format!(
+                "{}/auth/v1/token?grant_type=pkce",
+                self.config.base_url
+            ))
+            .header("apikey", &self.config.anon_key)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|error| Error::Network {
+                context: "exchanging OAuth code".to_owned(),
+                message: error.to_string(),
+            })?;
+        self.parse_session_response(response).await
+    }
+
+    /// Refreshes an expired access token.
+    ///
+    /// # Errors
+    ///
+    /// Returns a network, HTTP, or parse error.
+    pub async fn refresh(&self, refresh_token: &str) -> Result<Session> {
+        let body = serde_json::json!({ "refresh_token": refresh_token });
+        let response = self
+            .client
+            .post(format!(
+                "{}/auth/v1/token?grant_type=refresh_token",
+                self.config.base_url
+            ))
+            .header("apikey", &self.config.anon_key)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|error| Error::Network {
+                context: "refreshing session".to_owned(),
+                message: error.to_string(),
+            })?;
+        self.parse_session_response(response).await
+    }
+
+    async fn parse_session_response(&self, response: reqwest::Response) -> Result<Session> {
+        let status = response.status();
+        let body = response.text().await.map_err(|error| Error::Network {
+            context: "reading auth response".to_owned(),
+            message: error.to_string(),
+        })?;
+        if !status.is_success() {
+            return Err(Error::Http {
+                status: status.as_u16(),
+                url: body,
+            });
+        }
+        parse_session(&body)
+    }
+}
+
+async fn write_callback_response(
+    socket: &mut tokio::net::TcpStream,
+    status: u16,
+    message: &str,
+) -> std::io::Result<()> {
+    let reason = match status {
+        200 => "OK",
+        400 => "Bad Request",
+        _ => "Not Found",
+    };
+    let page = format!(
+        "<!doctype html><meta charset=\"utf-8\"><title>LuaTools</title><body style=\"font-family:sans-serif;padding:3rem\"><h2>{}</h2></body>",
+        escape_html(message)
+    );
+    let response = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{page}",
+        page.len()
+    );
+    socket.write_all(response.as_bytes()).await?;
+    socket.shutdown().await
+}
+
+fn escape_html(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// Parses a Supabase token response into a [`Session`].
+///
+/// # Errors
+///
+/// Returns [`Error::Parse`] when the body is not a valid session object.
+pub fn parse_session(body: &str) -> Result<Session> {
+    let raw: SupabaseSession = serde_json::from_str(body)
+        .map_err(|error| Error::parse("auth session", error.to_string()))?;
+    let mut display_name = raw
+        .user
+        .as_ref()
+        .and_then(|user| user.user_metadata.as_ref())
+        .and_then(|metadata| metadata.custom_claims.as_ref())
+        .and_then(|claims| claims.global_name.clone());
+    if display_name.as_deref().is_none_or(str::is_empty) {
+        display_name = raw
+            .user
+            .as_ref()
+            .and_then(|user| user.user_metadata.as_ref())
+            .and_then(|metadata| metadata.full_name.clone().or_else(|| metadata.name.clone()));
+    }
+    if display_name.as_deref().is_none_or(str::is_empty) {
+        display_name = raw.user.as_ref().and_then(|user| user.email.clone());
+    }
+    let expires_in = raw.expires_in.max(0);
+    Ok(Session {
+        access_token: raw.access_token,
+        refresh_token: raw.refresh_token.filter(|token| !token.is_empty()),
+        expires_at: Utc::now() + ChronoDuration::seconds(expires_in),
+        display_name,
+        email: raw.user.as_ref().and_then(|user| user.email.clone()),
+        avatar_url: raw
+            .user
+            .and_then(|user| user.user_metadata)
+            .and_then(|metadata| metadata.avatar_url),
+    })
+}
+
+#[derive(Debug, Deserialize)]
+struct SupabaseSession {
+    access_token: String,
+    #[serde(default)]
+    refresh_token: Option<String>,
+    #[serde(default)]
+    expires_in: i64,
+    #[serde(default)]
+    user: Option<SupabaseUser>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SupabaseUser {
+    #[serde(default)]
+    email: Option<String>,
+    #[serde(default)]
+    user_metadata: Option<UserMetadata>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct UserMetadata {
+    #[serde(default)]
+    full_name: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    avatar_url: Option<String>,
+    #[serde(default)]
+    custom_claims: Option<CustomClaims>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct CustomClaims {
+    #[serde(default)]
+    global_name: Option<String>,
 }
 
 /// Persists and restores the account session.
@@ -422,5 +759,58 @@ mod tests {
         let store = FileSecretStore::new(&path);
         let error = store.load().expect_err("corrupt file must fail");
         assert!(error.to_string().contains("auth session"), "{error}");
+    }
+    #[test]
+    fn authorize_url_contains_encoded_callback_and_challenge() {
+        let config = AuthConfig {
+            base_url: "https://db.example".to_owned(),
+            anon_key: "anon".to_owned(),
+            callback_port: 53_789,
+        };
+        let client = AuthClient::new(reqwest::Client::new(), config);
+        let url = client.authorize_url("challenge");
+        assert!(url.starts_with("https://db.example/auth/v1/authorize?provider=discord"));
+        assert!(url.contains("redirect_to=http%3A%2F%2Flocalhost%3A53789%2Fcallback"));
+        assert!(url.contains("code_challenge=challenge"));
+        assert!(url.contains("code_challenge_method=s256"));
+    }
+
+    #[test]
+    fn session_parser_prefers_global_name_and_keeps_metadata() {
+        let body = r#"{
+            "access_token":"a",
+            "refresh_token":"r",
+            "expires_in":3600,
+            "user":{
+                "email":"a@example.com",
+                "user_metadata":{
+                    "full_name":"Full Name",
+                    "name":"Name",
+                    "avatar_url":"https://cdn/a.png",
+                    "custom_claims":{"global_name":"Global"}
+                }
+            }
+        }"#;
+        let session = parse_session(body).expect("valid session");
+        assert_eq!(session.access_token, "a");
+        assert_eq!(session.refresh_token.as_deref(), Some("r"));
+        assert_eq!(session.display_name.as_deref(), Some("Global"));
+        assert_eq!(session.email.as_deref(), Some("a@example.com"));
+        assert_eq!(session.avatar_url.as_deref(), Some("https://cdn/a.png"));
+        assert!(!session.is_expired(Utc::now()));
+    }
+
+    #[test]
+    fn session_parser_falls_back_to_email_and_rejects_bad_json() {
+        let body = r#"{"access_token":"a","expires_in":0,"user":{"email":"a@example.com"}}"#;
+        let session = parse_session(body).expect("valid session");
+        assert_eq!(session.display_name.as_deref(), Some("a@example.com"));
+        assert!(session.refresh_token.is_none());
+        assert!(parse_session("nope").is_err());
+    }
+
+    #[test]
+    fn callback_html_escapes_provider_text() {
+        assert_eq!(escape_html("<script>&\""), "&lt;script&gt;&amp;&quot;");
     }
 }

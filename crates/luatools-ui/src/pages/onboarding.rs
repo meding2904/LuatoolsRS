@@ -2,6 +2,7 @@
 
 use eframe::egui::{self, Align, Layout, RichText, Sense, Stroke};
 use luatools_core::{Command, Locale};
+use luatools_i18n::Key;
 
 use crate::pages::Page;
 use crate::state::AppState;
@@ -18,13 +19,21 @@ pub enum Step {
     Language,
     /// Confirm the detected Steam folder.
     SteamFolder,
+    /// Choose whether to install the Steam store plugin.
+    Plugin,
     /// Summary.
     Done,
 }
 
 impl Step {
     /// Every step, in order.
-    const ALL: [Self; 4] = [Self::Welcome, Self::Language, Self::SteamFolder, Self::Done];
+    const ALL: [Self; 5] = [
+        Self::Welcome,
+        Self::Language,
+        Self::SteamFolder,
+        Self::Plugin,
+        Self::Done,
+    ];
 
     /// Zero-based position in the flow.
     const fn index(self) -> usize {
@@ -32,7 +41,8 @@ impl Step {
             Self::Welcome => 0,
             Self::Language => 1,
             Self::SteamFolder => 2,
-            Self::Done => 3,
+            Self::Plugin => 3,
+            Self::Done => 4,
         }
     }
 
@@ -41,7 +51,8 @@ impl Step {
         match self {
             Self::Welcome => Self::Language,
             Self::Language => Self::SteamFolder,
-            Self::SteamFolder | Self::Done => Self::Done,
+            Self::SteamFolder => Self::Plugin,
+            Self::Plugin | Self::Done => Self::Done,
         }
     }
 
@@ -50,28 +61,42 @@ impl Step {
         match self {
             Self::Welcome | Self::Language => Self::Welcome,
             Self::SteamFolder => Self::Language,
-            Self::Done => Self::SteamFolder,
+            Self::Plugin => Self::SteamFolder,
+            Self::Done => Self::Plugin,
         }
     }
 
     /// Section label shown above the step body.
-    const fn title(self) -> &'static str {
+    fn title(self, app: &AppState) -> String {
         match self {
-            Self::Welcome => "WELCOME",
-            Self::Language => "LANGUAGE",
-            Self::SteamFolder => "STEAM FOLDER",
-            Self::Done => "READY",
+            Self::Welcome => "WELCOME".to_owned(),
+            Self::Language => app.t(Key::Settings_Language).to_uppercase(),
+            Self::SteamFolder => app.t(Key::Settings_SteamLocation).to_uppercase(),
+            Self::Plugin => app.t(Key::Onboarding_Plugin_Title).to_uppercase(),
+            Self::Done => "READY".to_owned(),
         }
     }
 }
 
 /// Onboarding transient state.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct State {
     /// Current step.
     pub step: Step,
     /// Pending native folder picker for the Steam root.
     pub steam_picker: Option<std::sync::mpsc::Receiver<Option<std::path::PathBuf>>>,
+    /// Whether the Steam store plugin should be installed.
+    pub install_plugin: bool,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        Self {
+            step: Step::default(),
+            steam_picker: None,
+            install_plugin: true,
+        }
+    }
 }
 
 /// Renders onboarding full-screen. The shell decides when to show it.
@@ -106,7 +131,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut AppState, state: &mut State) {
             ui.add_space(12.0);
 
             widgets::card(ui, &theme, |ui| {
-                widgets::section_label(ui, &theme, state.step.title());
+                widgets::section_label(ui, &theme, &state.step.title(app));
                 ui.add_space(8.0);
                 step_body(ui, app, state, &theme);
             });
@@ -123,8 +148,8 @@ fn step_body(ui: &mut egui::Ui, app: &mut AppState, state: &mut State, theme: &T
         Step::Welcome => {
             ui.label(
                 RichText::new(
-                    "LuaTools scans your Steam libraries, edits launch options, and downloads \
-                     depot content for your own account.",
+                    "LuaTools scans your Steam libraries, edits launch options, and queues \
+                     plain file downloads. Game installs are handed to Steam.",
                 )
                 .size(theme.text_size)
                 .color(theme.text),
@@ -138,12 +163,51 @@ fn step_body(ui: &mut egui::Ui, app: &mut AppState, state: &mut State, theme: &T
                 .size(theme.text_size)
                 .color(theme.muted),
             );
+            ui.add_space(10.0);
+            widgets::divider(ui, theme);
+            ui.add_space(10.0);
+            match &app.auth {
+                luatools_core::AuthState::SignedIn { profile } => {
+                    let name = profile
+                        .display_name
+                        .as_deref()
+                        .or(profile.email.as_deref())
+                        .unwrap_or("Account");
+                    ui.label(
+                        RichText::new(app.tf(Key::Home_SignedInAs, &[name]))
+                            .size(theme.text_size)
+                            .color(theme.text),
+                    );
+                }
+                luatools_core::AuthState::WaitingForBrowser { .. } => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(app.t(Key::Nav_WaitingForBrowser));
+                        if widgets::link_button(ui, theme, app.t(Key::Downloads_Action_Cancel))
+                            .clicked()
+                        {
+                            app.send(Command::CancelSignIn);
+                        }
+                    });
+                }
+                luatools_core::AuthState::Failed { .. } | luatools_core::AuthState::Guest => {
+                    ui.label(
+                        RichText::new(app.t(Key::Onboarding_SignIn_Blurb))
+                            .size(theme.small_size)
+                            .color(theme.muted),
+                    );
+                    if widgets::secondary_button(ui, theme, app.t(Key::Nav_SignInDiscord)).clicked()
+                    {
+                        app.send(Command::SignIn);
+                    }
+                }
+            }
         }
         Step::Language => {
             let mut selected = app.settings.language;
             ui.horizontal(|ui| {
                 ui.label(
-                    RichText::new("Interface language")
+                    RichText::new(app.t(Key::Settings_Language))
                         .size(theme.text_size)
                         .color(theme.text),
                 );
@@ -160,19 +224,22 @@ fn step_body(ui: &mut egui::Ui, app: &mut AppState, state: &mut State, theme: &T
             }
             ui.add_space(8.0);
             ui.label(
-                RichText::new("You can change this later in Settings, and it applies everywhere.")
+                RichText::new(app.t(Key::Settings_Language_Hint))
                     .size(theme.small_size)
                     .color(theme.muted),
             );
         }
         Step::SteamFolder => {
             match app.snapshot.steam_root.as_ref() {
-                Some(root) => {
-                    widgets::field_row(ui, theme, "Steam root", &root.display().to_string())
-                }
+                Some(root) => widgets::field_row(
+                    ui,
+                    theme,
+                    app.t(Key::Settings_SteamLocation),
+                    &root.display().to_string(),
+                ),
                 None => {
                     ui.label(
-                        RichText::new("Steam was not found in the usual locations.")
+                        RichText::new(app.t(Key::Home_SteamNotFound))
                             .size(theme.text_size)
                             .color(theme.warning),
                     );
@@ -184,19 +251,32 @@ fn step_body(ui: &mut egui::Ui, app: &mut AppState, state: &mut State, theme: &T
                 "Library apps",
                 &app.snapshot.apps.len().to_string(),
             );
+            widgets::field_row(
+                ui,
+                theme,
+                app.t(Key::Onboarding_Plugin_Title),
+                if state.install_plugin {
+                    app.t(Key::Onboarding_Yes)
+                } else {
+                    app.t(Key::Onboarding_No)
+                },
+            );
             ui.add_space(10.0);
             ui.horizontal(|ui| {
                 if app.is_busy("library") {
                     ui.spinner();
                     ui.label(
-                        RichText::new("Scanning Steam libraries…")
+                        RichText::new(app.t(Key::Manage_LoadingGames))
                             .size(theme.small_size + 0.5)
                             .color(theme.muted),
                     );
-                } else if widgets::secondary_button(ui, theme, "Scan now").clicked() {
+                } else if widgets::secondary_button(ui, theme, app.t(Key::Manage_Refresh)).clicked()
+                {
                     app.send(Command::RefreshLibrary);
                 }
-                if widgets::secondary_button(ui, theme, "Choose folder…").clicked() {
+                if widgets::secondary_button(ui, theme, app.t(Key::Settings_ChooseSteamFolder))
+                    .clicked()
+                {
                     state.steam_picker = Some(crate::dialogs::pick_folder(
                         app.settings
                             .steam_path
@@ -222,6 +302,31 @@ fn step_body(ui: &mut egui::Ui, app: &mut AppState, state: &mut State, theme: &T
                 .color(theme.muted),
             );
         }
+        Step::Plugin => {
+            ui.label(
+                RichText::new(app.t(Key::Onboarding_Plugin_Title))
+                    .size(theme.text_size)
+                    .color(theme.text),
+            );
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(app.t(Key::Onboarding_Plugin_Detail))
+                    .size(theme.small_size)
+                    .color(theme.muted),
+            );
+            ui.add_space(10.0);
+            if !cfg!(windows) {
+                ui.label(
+                    RichText::new("The plugin loader is Windows-only; this choice is ignored on other platforms.")
+                        .size(theme.small_size)
+                        .color(theme.warning),
+                );
+            }
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut state.install_plugin, true, app.t(Key::Onboarding_Yes));
+                ui.selectable_value(&mut state.install_plugin, false, app.t(Key::Onboarding_No));
+            });
+        }
         Step::Done => {
             ui.label(
                 RichText::new("Everything is ready.")
@@ -230,13 +335,33 @@ fn step_body(ui: &mut egui::Ui, app: &mut AppState, state: &mut State, theme: &T
                     .strong(),
             );
             ui.add_space(10.0);
-            widgets::field_row(ui, theme, "Language", app.settings.language.native_name());
-            widgets::field_row(ui, theme, "Steam root", &steam_root_label(app));
+            widgets::field_row(
+                ui,
+                theme,
+                app.t(Key::Settings_Language),
+                app.settings.language.native_name(),
+            );
+            widgets::field_row(
+                ui,
+                theme,
+                app.t(Key::Settings_SteamLocation),
+                &steam_root_label(app),
+            );
             widgets::field_row(
                 ui,
                 theme,
                 "Library apps",
                 &app.snapshot.apps.len().to_string(),
+            );
+            widgets::field_row(
+                ui,
+                theme,
+                app.t(Key::Onboarding_Plugin_Title),
+                if state.install_plugin {
+                    app.t(Key::Onboarding_Yes)
+                } else {
+                    app.t(Key::Onboarding_No)
+                },
             );
             ui.add_space(10.0);
             ui.label(
@@ -285,6 +410,7 @@ fn navigation(ui: &mut egui::Ui, app: &mut AppState, state: &mut State, theme: &
     if advance {
         if state.step == Step::Done {
             app.settings.onboarding_completed = true;
+            app.settings.plugin_enabled = state.install_plugin;
             app.save_settings();
             app.page = Page::Home;
         } else {
@@ -324,7 +450,7 @@ fn step_dots(ui: &mut egui::Ui, theme: &Theme, current: Step) {
 /// Steam root for the summary step.
 fn steam_root_label(app: &AppState) -> String {
     app.snapshot.steam_root.as_ref().map_or_else(
-        || "Not detected".to_owned(),
+        || app.t(Key::Settings_SteamSource_NotFound).to_owned(),
         |root| root.display().to_string(),
     )
 }
@@ -355,10 +481,12 @@ mod tests {
     fn steps_move_in_both_directions() {
         assert_eq!(Step::Welcome.next(), Step::Language);
         assert_eq!(Step::Language.next(), Step::SteamFolder);
-        assert_eq!(Step::SteamFolder.next(), Step::Done);
+        assert_eq!(Step::SteamFolder.next(), Step::Plugin);
+        assert_eq!(Step::Plugin.next(), Step::Done);
         assert_eq!(Step::Done.next(), Step::Done);
 
-        assert_eq!(Step::Done.previous(), Step::SteamFolder);
+        assert_eq!(Step::Done.previous(), Step::Plugin);
+        assert_eq!(Step::Plugin.previous(), Step::SteamFolder);
         assert_eq!(Step::SteamFolder.previous(), Step::Language);
         assert_eq!(Step::Language.previous(), Step::Welcome);
         assert_eq!(Step::Welcome.previous(), Step::Welcome);

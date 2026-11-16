@@ -7,6 +7,10 @@
 //! therefore settles as `Failed` with an invalid-request message rather than downloading
 //! content.
 //!
+//! Plain file transfers are staged, optionally paced to [`QueueConfig::speed_limit_bytes`],
+//! verified against the advertised length (and hashed with SHA-256) when verification is on,
+//! then moved into the request's destination directory.
+//!
 //! # Model
 //!
 //! [`DownloadQueue::spawn`] starts one Tokio task that owns all mutable state. The returned

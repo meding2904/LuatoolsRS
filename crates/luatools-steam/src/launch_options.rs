@@ -10,146 +10,41 @@ use std::sync::{Mutex, MutexGuard};
 
 use chrono::{DateTime, Utc};
 use indexmap::IndexMap;
-use luatools_core::{AppId, Error, Result};
+use luatools_core::{AppId, Error, LaunchOption, Result};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 use crate::binary_vdf::Bvdf;
 
-/// One entry behind Steam's Play button.
+pub use luatools_core::filter_for_os;
+
+/// Reads one entry out of its `config.launch.<n>` table.
 ///
-/// Unused optional fields are empty strings. Steam omits them from appinfo entirely rather
-/// than writing blank values.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, rename_all = "PascalCase")]
-pub struct LaunchOption {
-    /// Executable to run, relative to the install directory.
-    pub executable: String,
-    /// Command-line arguments.
-    pub arguments: String,
-    /// Working directory, usually empty.
-    pub working_dir: String,
-    /// Human-readable label shown by Steam.
-    pub description: String,
-    /// Steam option type (`default`, `option1`, ...).
-    ///
-    /// The C# model calls this `Type`; it is renamed to `option_type` in Rust.
-    #[serde(rename = "Type")]
-    pub option_type: String,
-    /// Operating systems this entry applies to (`windows`, `linux,macos`, ...).
-    pub os_list: String,
-    /// CPU architecture restriction, usually empty.
-    pub os_arch: String,
-    /// Beta branch key required for this entry.
-    pub beta_key: String,
-    /// DLC ownership marker carried by some entries.
-    pub owns_dlc: String,
-}
-
-impl Default for LaunchOption {
-    fn default() -> Self {
-        Self {
-            executable: String::new(),
-            arguments: String::new(),
-            working_dir: String::new(),
-            description: String::new(),
-            option_type: "default".to_owned(),
-            os_list: String::new(),
-            os_arch: String::new(),
-            beta_key: String::new(),
-            owns_dlc: String::new(),
-        }
-    }
-}
-
-impl LaunchOption {
-    /// Reads one entry out of its `config.launch.<n>` table.
-    ///
-    /// A missing `type` becomes an empty string, matching the C# `FromTable` behaviour (the
-    /// `"default"` value is only a constructor default).
-    #[must_use]
-    pub fn from_table(table: &Bvdf) -> Self {
-        let config = table.get_table("config");
-        Self {
-            executable: table.get_text("executable").unwrap_or_default(),
-            arguments: table.get_text("arguments").unwrap_or_default(),
-            working_dir: table.get_text("workingdir").unwrap_or_default(),
-            description: table.get_text("description").unwrap_or_default(),
-            option_type: table.get_text("type").unwrap_or_default(),
-            os_list: config
-                .and_then(|value| value.get_text("oslist"))
-                .unwrap_or_default(),
-            os_arch: config
-                .and_then(|value| value.get_text("osarch"))
-                .unwrap_or_default(),
-            beta_key: config
-                .and_then(|value| value.get_text("BetaKey"))
-                .unwrap_or_default(),
-            owns_dlc: config
-                .and_then(|value| value.get_text("ownsdlc"))
-                .unwrap_or_default(),
-        }
-    }
-
-    /// A short label built from the executable, arguments, and OS list.
-    ///
-    /// Values are joined with two spaces, a middle dot, and two spaces.
-    #[must_use]
-    pub fn summary(&self) -> String {
-        let mut parts = Vec::with_capacity(3);
-        if !self.executable.trim().is_empty() {
-            parts.push(self.executable.trim());
-        }
-        if !self.arguments.trim().is_empty() {
-            parts.push(self.arguments.trim());
-        }
-        if !self.os_list.trim().is_empty() {
-            parts.push(self.os_list.trim());
-        }
-        parts.join("  ·  ")
-    }
-
-    /// Returns true when this option applies to `os`.
-    ///
-    /// An empty OS list matches every platform. Tokens are comma- or semicolon-separated
-    /// and compared ASCII case-insensitively. `win`, `mac`, and `osx` are accepted as
-    /// aliases for `windows` and `macos`.
-    #[must_use]
-    pub fn applies_to_os(&self, os: &str) -> bool {
-        let list = self.os_list.trim();
-        if list.is_empty() {
-            return true;
-        }
-
-        let current = normalize_os(os);
-        list.split([',', ';'])
-            .map(str::trim)
-            .filter(|token| !token.is_empty())
-            .any(|token| normalize_os(token) == current)
-    }
-
-    /// Returns true when this option applies to the platform the crate is running on.
-    #[must_use]
-    pub fn applies_to_current_os(&self) -> bool {
-        self.applies_to_os(std::env::consts::OS)
-    }
-}
-
-/// Filters launch options to those matching `os`, preserving input order.
+/// A missing `type` becomes an empty string, matching the C# `FromTable` behaviour (the
+/// `"default"` value is only a constructor default).
 #[must_use]
-pub fn filter_for_os<'a>(options: &'a [LaunchOption], os: &str) -> Vec<&'a LaunchOption> {
-    options
-        .iter()
-        .filter(|option| option.applies_to_os(os))
-        .collect()
-}
-
-fn normalize_os(value: &str) -> String {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "win" | "windows" => "windows".to_owned(),
-        "mac" | "macos" | "osx" | "darwin" => "macos".to_owned(),
-        "linux" | "steamos" => "linux".to_owned(),
-        other => other.to_owned(),
+pub fn launch_option_from_table(table: &Bvdf) -> LaunchOption {
+    let config = table.get_table("config");
+    LaunchOption {
+        index: String::new(),
+        source_index: String::new(),
+        executable: table.get_text("executable").unwrap_or_default(),
+        arguments: table.get_text("arguments").unwrap_or_default(),
+        working_dir: table.get_text("workingdir").unwrap_or_default(),
+        description: table.get_text("description").unwrap_or_default(),
+        option_type: table.get_text("type").unwrap_or_default(),
+        os_list: config
+            .and_then(|value| value.get_text("oslist"))
+            .unwrap_or_default(),
+        os_arch: config
+            .and_then(|value| value.get_text("osarch"))
+            .unwrap_or_default(),
+        beta_key: config
+            .and_then(|value| value.get_text("BetaKey"))
+            .unwrap_or_default(),
+        owns_dlc: config
+            .and_then(|value| value.get_text("ownsdlc"))
+            .unwrap_or_default(),
     }
 }
 
@@ -169,15 +64,89 @@ pub fn read_launch_options(app_body: &Bvdf) -> Vec<LaunchOption> {
     launch
         .items()
         .iter()
-        .filter_map(|property| property.as_table().map(LaunchOption::from_table))
+        .filter_map(|property| {
+            property.as_table().map(|table| {
+                let mut option = launch_option_from_table(table);
+                option.index = property.name.clone();
+                option.source_index = property.name.clone();
+                option
+            })
+        })
         .collect()
+}
+
+/// Replaces an app body's `config.launch` table with `options`, preserving unmodelled keys on
+/// entries that still have a same-index table.
+///
+/// The table key is the list position (`0`, `1`, ...), because Steam reads the running order
+/// from the key. Empty optional fields are removed rather than written blank, matching Steam.
+pub fn write_launch_options(app_body: &mut Bvdf, options: &[LaunchOption]) {
+    let previous = app_body
+        .get_table("config")
+        .and_then(|config| config.get_table("launch"))
+        .cloned();
+    let mut launch = Bvdf::with_capacity(options.len());
+    for (index, option) in options.iter().enumerate() {
+        let lookup = if option.source_index.is_empty() {
+            index.to_string()
+        } else {
+            option.source_index.clone()
+        };
+        let mut table = previous
+            .as_ref()
+            .and_then(|launch| launch.get_table(&lookup).cloned())
+            .unwrap_or_default();
+        set_or_remove(&mut table, "executable", &option.executable);
+        set_or_remove(&mut table, "arguments", &option.arguments);
+        set_or_remove(&mut table, "workingdir", &option.working_dir);
+        set_or_remove(&mut table, "description", &option.description);
+        set_or_remove(&mut table, "type", &option.option_type);
+
+        let any_config = !option.os_list.trim().is_empty()
+            || !option.os_arch.trim().is_empty()
+            || !option.beta_key.trim().is_empty()
+            || !option.owns_dlc.trim().is_empty();
+        if any_config {
+            if table.get_table("config").is_none() {
+                table.push_table("config", Bvdf::default());
+            }
+            if let Some(config) = table.get_table_mut("config") {
+                set_or_remove(config, "oslist", &option.os_list);
+                set_or_remove(config, "osarch", &option.os_arch);
+                set_or_remove(config, "BetaKey", &option.beta_key);
+                set_or_remove(config, "ownsdlc", &option.owns_dlc);
+            }
+        } else if table.get_table("config").is_some_and(Bvdf::is_empty) {
+            table.remove("config");
+        }
+        launch.push_table(index.to_string(), table);
+    }
+
+    match app_body.get_table_mut("config") {
+        Some(config) => {
+            config.remove("launch");
+            config.push_table("launch", launch);
+        }
+        None => {
+            let mut config = Bvdf::default();
+            config.push_table("launch", launch);
+            app_body.push_table("config", config);
+        }
+    }
+}
+
+fn set_or_remove(table: &mut Bvdf, key: &str, value: &str) {
+    let value = value.trim();
+    table.remove(key);
+    if !value.is_empty() {
+        table.push_text(key, value);
+    }
 }
 
 /// One game's staged launch-option edit plus the snapshot needed to undo it.
 ///
-/// List order is authoritative. The C# JSON also carries each entry's `Index` and
-/// `SourceIndex`, but the crate-level [`LaunchOption`] model intentionally does not, so
-/// those two fields are not written.
+/// List order is authoritative. Each entry also carries its original `Index` and
+/// `SourceIndex` so unmodelled keys survive a reorder.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct LaunchMod {
@@ -654,5 +623,66 @@ mod tests {
         assert!(store.is_empty());
         assert!(dir.path().join("launchmods.json.corrupt").exists());
         assert!(!path.exists());
+    }
+    #[test]
+    fn write_replaces_launch_table_and_omits_empty_fields() {
+        let mut body = Bvdf::default();
+        let mut config = Bvdf::default();
+        let mut launch = Bvdf::default();
+        let mut existing = Bvdf::default();
+        existing.push_text("executable", "old.exe");
+        existing.push_text("vacmodulefilename", "keep.bin");
+        launch.push_table("0", existing);
+        config.push_table("launch", launch);
+        body.push_table("config", config);
+
+        let options = vec![
+            option("new.exe", "-novid", "windows"),
+            LaunchOption {
+                executable: "tool.exe".to_owned(),
+                ..LaunchOption::default()
+            },
+        ];
+        write_launch_options(&mut body, &options);
+        let launch = body
+            .get_table("config")
+            .and_then(|config| config.get_table("launch"))
+            .expect("launch table");
+        assert_eq!(launch.items().len(), 2);
+        let first = launch.get_table("0").expect("first");
+        assert_eq!(first.get_text("executable").as_deref(), Some("new.exe"));
+        assert_eq!(first.get_text("arguments").as_deref(), Some("-novid"));
+        assert_eq!(
+            first.get_text("vacmodulefilename").as_deref(),
+            Some("keep.bin")
+        );
+        assert!(first.get_text("workingdir").is_none());
+        assert_eq!(
+            first
+                .get_table("config")
+                .and_then(|config| config.get_text("oslist"))
+                .as_deref(),
+            Some("windows")
+        );
+        let second = launch.get_table("1").expect("second");
+        assert_eq!(second.get_text("executable").as_deref(), Some("tool.exe"));
+        assert!(second.get_text("arguments").is_none());
+    }
+
+    #[test]
+    fn write_creates_config_and_launch_when_missing() {
+        let mut body = Bvdf::default();
+        write_launch_options(&mut body, &[option("game.exe", "", "")]);
+        let launch = body
+            .get_table("config")
+            .and_then(|config| config.get_table("launch"))
+            .expect("launch table");
+        assert_eq!(
+            launch
+                .get_table("0")
+                .and_then(|table| table.get_text("executable"))
+                .as_deref(),
+            Some("game.exe")
+        );
     }
 }

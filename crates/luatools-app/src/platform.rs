@@ -5,6 +5,110 @@ use std::process::Command;
 
 use luatools_core::error::{Error, Result};
 
+/// Registers the `luatools://` URL scheme with the operating system.
+///
+/// Best effort: a failure is logged by the caller and never blocks startup. Windows uses the
+/// per-user registry, Linux writes a desktop entry and asks `xdg-mime` to make it the default.
+pub fn register_protocol() -> Result<()> {
+    let exe = std::env::current_exe()
+        .map_err(|error| Error::Other(format!("resolving executable: {error}")))?;
+    #[cfg(windows)]
+    {
+        let key = "HKCU\\Software\\Classes\\luatools";
+        let _ = Command::new("reg")
+            .args(["add", key, "/ve", "/d", "URL:LuaTools Protocol", "/f"])
+            .status();
+        let _ = Command::new("reg")
+            .args(["add", key, "/v", "URL Protocol", "/d", "", "/f"])
+            .status();
+        let command = format!("\"{}\" \"%1\"", exe.display());
+        return Command::new("reg")
+            .args([
+                "add",
+                &format!("{key}\\shell\\open\\command"),
+                "/ve",
+                "/d",
+                &command,
+                "/f",
+            ])
+            .status()
+            .map(|_| ())
+            .map_err(|error| Error::Other(format!("registering protocol: {error}")));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let base = directories::BaseDirs::new()
+            .ok_or_else(|| Error::Other("no home directory".to_owned()))?;
+        let applications = base.data_dir().join("applications");
+        let _ = std::fs::create_dir_all(base.config_dir());
+        std::fs::create_dir_all(&applications)
+            .map_err(|error| Error::io(format!("creating {}", applications.display()), error))?;
+        let entry = applications.join("luatools.desktop");
+        let body = format!(
+            "[Desktop Entry]\nType=Application\nName=LuaTools\nComment=Steam library companion\nExec=\"{}\" %u\nTerminal=false\nMimeType=x-scheme-handler/luatools;\n",
+            exe.display()
+        );
+        std::fs::write(&entry, body)
+            .map_err(|error| Error::io(format!("writing {}", entry.display()), error))?;
+        let _ = Command::new("xdg-mime")
+            .args(["default", "luatools.desktop", "x-scheme-handler/luatools"])
+            .status();
+        return Ok(());
+    }
+    #[allow(unreachable_code)]
+    Err(Error::Unsupported("protocol registration"))
+}
+
+/// Enables or disables starting LuaTools with the operating system.
+///
+/// Best effort, matching the original application: a failed registry or desktop-file write is
+/// surfaced to the caller but never blocks startup.
+pub fn set_start_with_os(enabled: bool) -> Result<()> {
+    let exe = std::env::current_exe()
+        .map_err(|error| Error::Other(format!("resolving executable: {error}")))?;
+    #[cfg(windows)]
+    {
+        let key = "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+        if enabled {
+            let command = format!("\"{}\" --minimized", exe.display());
+            return Command::new("reg")
+                .args(["add", key, "/v", "LuaTools", "/d", &command, "/f"])
+                .status()
+                .map(|_| ())
+                .map_err(|error| Error::Other(format!("enabling autostart: {error}")));
+        }
+        return Command::new("reg")
+            .args(["delete", key, "/v", "LuaTools", "/f"])
+            .status()
+            .map(|_| ())
+            .map_err(|error| Error::Other(format!("disabling autostart: {error}")));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let base = directories::BaseDirs::new()
+            .ok_or_else(|| Error::Other("no home directory".to_owned()))?;
+        let autostart = base.config_dir().join("autostart");
+        let entry = autostart.join("luatools.desktop");
+        if !enabled {
+            return match std::fs::remove_file(&entry) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(Error::io(format!("removing {}", entry.display()), error)),
+            };
+        }
+        std::fs::create_dir_all(&autostart)
+            .map_err(|error| Error::io(format!("creating {}", autostart.display()), error))?;
+        let body = format!(
+            "[Desktop Entry]\nType=Application\nName=LuaTools\nExec=\"{}\" --minimized\nTerminal=false\nX-GNOME-Autostart-enabled=true\n",
+            exe.display()
+        );
+        return std::fs::write(&entry, body)
+            .map_err(|error| Error::io(format!("writing {}", entry.display()), error));
+    }
+    #[allow(unreachable_code)]
+    Err(Error::Unsupported("start with the operating system"))
+}
+
 /// Opens a file or directory with the desktop default handler.
 ///
 /// # Errors
@@ -78,6 +182,72 @@ pub fn install_steam_app(app_id: u32) -> Result<()> {
 /// Returns [`Error::Unsupported`] when the platform has no protocol handler.
 pub fn open_store_page(app_id: u32) -> Result<()> {
     open_steam_url(&format!("steam://store/{app_id}"))
+}
+
+/// Returns whether Steam is currently running.
+///
+/// Best effort: a platform without a process probe reports `false`, which means an appinfo
+/// write may fail rather than the application closing a client it cannot restart.
+#[must_use]
+pub fn steam_is_running() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        return Command::new("pgrep")
+            .args(["-x", "steam"])
+            .status()
+            .is_ok_and(|status| status.success());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        return Command::new("pgrep")
+            .args(["-x", "steam_osx"])
+            .status()
+            .is_ok_and(|status| status.success());
+    }
+    #[cfg(windows)]
+    {
+        let output = Command::new("tasklist")
+            .args(["/FI", "IMAGENAME eq steam.exe", "/NH"])
+            .output();
+        return output.is_ok_and(|output| {
+            String::from_utf8_lossy(&output.stdout)
+                .to_ascii_lowercase()
+                .contains("steam.exe")
+        });
+    }
+    #[allow(unreachable_code)]
+    false
+}
+
+/// Asks Steam to shut down and waits briefly for it to exit.
+///
+/// Returns true when the process appears to be gone, or when it was not running.
+pub fn stop_steam() -> bool {
+    if !steam_is_running() {
+        return true;
+    }
+    let steam = if cfg!(windows) { "steam.exe" } else { "steam" };
+    let _ = Command::new(steam).arg("-shutdown").status();
+    for _ in 0..20 {
+        if !steam_is_running() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    !steam_is_running()
+}
+
+/// Starts Steam in the background.
+///
+/// # Errors
+///
+/// Returns [`Error::Other`] when the Steam binary cannot be started.
+pub fn start_steam() -> Result<()> {
+    let steam = if cfg!(windows) { "steam.exe" } else { "steam" };
+    Command::new(steam)
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| Error::Other(format!("starting {steam}: {error}")))
 }
 
 /// Closes Steam and relaunches it.

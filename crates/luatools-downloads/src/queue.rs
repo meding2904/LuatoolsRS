@@ -34,16 +34,31 @@ pub struct QueueConfig {
     pub history_cap: usize,
     /// Directory plain-HTTP transfers are staged in.
     pub staging_dir: PathBuf,
+    /// Optional cap on the average transfer rate, in bytes per second.
+    ///
+    /// The cap applies to each plain-HTTP transfer individually; [`None`] or zero disables
+    /// it. The backend fills this from the user's settings.
+    pub speed_limit_bytes: Option<u64>,
+    /// Whether every enqueued request should be verified after transferring.
+    ///
+    /// This is the queue-wide default from the user's settings. A request that already asks
+    /// for verification stays verified even when this is false.
+    pub verify: bool,
 }
 
 impl QueueConfig {
     /// Creates a configuration with the default history cap of 100 entries.
+    ///
+    /// Speed limiting is disabled and verification is off until
+    /// [`QueueConfig::with_speed_limit`] or [`QueueConfig::with_verify`] overrides them.
     #[must_use]
     pub fn new(concurrency: usize, staging_dir: impl Into<PathBuf>) -> Self {
         Self {
             concurrency,
             history_cap: HistoryStore::DEFAULT_CAP,
             staging_dir: staging_dir.into(),
+            speed_limit_bytes: None,
+            verify: false,
         }
     }
 
@@ -51,6 +66,20 @@ impl QueueConfig {
     #[must_use]
     pub fn with_history_cap(mut self, history_cap: usize) -> Self {
         self.history_cap = history_cap;
+        self
+    }
+
+    /// Overrides the optional per-transfer speed limit, in bytes per second.
+    #[must_use]
+    pub fn with_speed_limit(mut self, speed_limit_bytes: Option<u64>) -> Self {
+        self.speed_limit_bytes = speed_limit_bytes;
+        self
+    }
+
+    /// Overrides whether every enqueued request is verified after transferring.
+    #[must_use]
+    pub fn with_verify(mut self, verify: bool) -> Self {
+        self.verify = verify;
         self
     }
 }
@@ -113,8 +142,10 @@ impl DownloadQueue {
         events: mpsc::UnboundedSender<Event>,
         history: Option<HistoryStore>,
     ) -> QueueHandle {
-        let transfer: Arc<dyn Transfer> =
-            Arc::new(HttpClientTransfer::new(config.staging_dir.clone()));
+        let transfer: Arc<dyn Transfer> = Arc::new(
+            HttpClientTransfer::new(config.staging_dir.clone())
+                .with_speed_limit(config.speed_limit_bytes),
+        );
         Self::spawn_with(config, events, history, transfer)
     }
 
@@ -396,7 +427,13 @@ impl Actor {
     }
 
     /// Adds a request unless an unfinished job already carries the same key.
-    fn enqueue(&mut self, request: DownloadRequest) {
+    fn enqueue(&mut self, mut request: DownloadRequest) {
+        // The queue-wide setting can only turn verification on; a request may already ask for
+        // it explicitly.
+        if self.config.verify {
+            request.verify = true;
+        }
+
         let key = request_key(&request);
         if self
             .items
@@ -1307,6 +1344,42 @@ mod tests {
         assert_eq!(items[0].fraction(), None);
 
         harness.handle.cancel(items[0].id);
+        harness.handle.shutdown().await;
+    }
+
+    #[test]
+    fn queue_config_builders_set_download_limits() {
+        let config = QueueConfig::new(2, std::env::temp_dir())
+            .with_history_cap(7)
+            .with_speed_limit(Some(1_048_576))
+            .with_verify(true);
+
+        assert_eq!(config.concurrency, 2);
+        assert_eq!(config.history_cap, 7);
+        assert_eq!(config.speed_limit_bytes, Some(1_048_576));
+        assert!(config.verify);
+
+        let defaults = QueueConfig::new(1, std::env::temp_dir());
+        assert_eq!(defaults.speed_limit_bytes, None);
+        assert!(!defaults.verify);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn queue_wide_verify_forces_request_verification() {
+        let harness = harness(QueueConfig::new(1, std::env::temp_dir()).with_verify(true));
+
+        harness.handle.enqueue(request(51));
+        let items = wait_for(&harness.handle, |items| {
+            items
+                .iter()
+                .any(|item| item.status == DownloadStatus::Completed)
+        })
+        .await;
+
+        assert!(
+            items[0].request.verify,
+            "the queue-wide setting must reach the transfer request"
+        );
         harness.handle.shutdown().await;
     }
 }

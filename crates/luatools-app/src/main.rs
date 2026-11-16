@@ -3,8 +3,11 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 mod backend;
+mod cef;
 mod logging;
 mod platform;
+mod plugin_api;
+mod plugin_installer;
 mod settings_store;
 mod single_instance;
 
@@ -35,6 +38,12 @@ fn main() -> eframe::Result {
     let store = SettingsStore::new(paths.settings_file());
     let settings = store.load();
     let startup = single_instance::parse_startup_args(std::env::args().skip(1));
+    if let Err(error) = platform::register_protocol() {
+        tracing::debug!(%error, "protocol registration failed");
+    }
+    if let Err(error) = platform::set_start_with_os(settings.start_with_os) {
+        tracing::debug!(%error, "autostart registration failed");
+    }
 
     let lock_path = paths.data_dir().join("instance.lock");
     let lock = match single_instance::InstanceLock::acquire(&lock_path) {
@@ -61,9 +70,13 @@ fn main() -> eframe::Result {
         .clone()
         .or_else(|| single_instance::take_pending(&pending));
 
-    if !startup.minimized
-        && let Err(error) = run_window(paths.clone(), settings.clone(), startup_url.clone())
-    {
+    let start_hidden = startup.minimized || settings.start_minimized;
+    if let Err(error) = run_window(
+        paths.clone(),
+        settings.clone(),
+        startup_url.clone(),
+        start_hidden,
+    ) {
         tracing::error!(%error, "the window could not be created");
         eprintln!("LuaTools: {error}");
     }
@@ -74,7 +87,12 @@ fn main() -> eframe::Result {
     Ok(())
 }
 
-fn run_window(paths: AppPaths, settings: Settings, startup_url: Option<String>) -> eframe::Result {
+fn run_window(
+    paths: AppPaths,
+    settings: Settings,
+    startup_url: Option<String>,
+    start_minimized: bool,
+) -> eframe::Result {
     let (handle, events) = match backend::spawn(BackendConfig {
         paths,
         settings: settings.clone(),
@@ -111,7 +129,7 @@ fn run_window(paths: AppPaths, settings: Settings, startup_url: Option<String>) 
         "LuaTools",
         options,
         Box::new(move |cc| {
-            let app = LuaToolsApp::new(cc, handle, events, settings);
+            let app = LuaToolsApp::new(cc, handle, events, settings, start_minimized);
             Ok(Box::new(app))
         }),
     )

@@ -23,6 +23,14 @@ pub enum Tab {
 pub struct State {
     /// Selected list.
     pub tab: Tab,
+    /// Show the add-URL dialog.
+    pub show_add: bool,
+    /// URL draft.
+    pub url: String,
+    /// Display-name draft.
+    pub name: String,
+    /// Inline validation message.
+    pub error: Option<String>,
 }
 
 /// Renders the queue and the finished-job history.
@@ -44,13 +52,31 @@ pub fn show(ui: &mut egui::Ui, app: &mut AppState, state: &mut State) {
 
     let mut confirm_clear = false;
     ui.horizontal(|ui| {
-        if widgets::chip(ui, &theme, "Active", state.tab == Tab::Active).clicked() {
+        if widgets::chip(
+            ui,
+            &theme,
+            app.t(Key::Downloads_Section_Active),
+            state.tab == Tab::Active,
+        )
+        .clicked()
+        {
             state.tab = Tab::Active;
         }
-        if widgets::chip(ui, &theme, "History", state.tab == Tab::History).clicked() {
+        if widgets::chip(
+            ui,
+            &theme,
+            app.t(Key::Downloads_Section_History),
+            state.tab == Tab::History,
+        )
+        .clicked()
+        {
             state.tab = Tab::History;
         }
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if widgets::primary_button(ui, &theme, app.t(Key::Add_Download)).clicked() {
+                state.show_add = true;
+                state.error = None;
+            }
             if state.tab == Tab::History
                 && history_count > 0
                 && widgets::secondary_button(ui, &theme, app.t(Key::Downloads_Action_ClearHistory))
@@ -72,6 +98,10 @@ pub fn show(ui: &mut egui::Ui, app: &mut AppState, state: &mut State) {
     }
     ui.add_space(12.0);
 
+    if state.show_add {
+        add_dialog(ui, app, state);
+    }
+
     match state.tab {
         Tab::Active => {
             let rows = sorted_open(&app.downloads);
@@ -80,7 +110,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut AppState, state: &mut State) {
                     ui,
                     &theme,
                     "No active downloads",
-                    "Queue a depot or file to follow its progress here.",
+                    app.t(Key::Downloads_Empty),
                 );
                 return;
             }
@@ -107,6 +137,70 @@ pub fn show(ui: &mut egui::Ui, app: &mut AppState, state: &mut State) {
                 }
             });
         }
+    }
+}
+
+/// The add-URL dialog.
+fn add_dialog(ui: &mut egui::Ui, app: &mut AppState, state: &mut State) {
+    let theme = app.theme;
+    let mut close = false;
+    let mut queue = false;
+    egui::Window::new(app.t(Key::Add_Download))
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+        .show(ui.ctx(), |ui| {
+            ui.set_width(460.0);
+            ui.label(
+                RichText::new("Queue a direct HTTP(S) file download.")
+                    .size(theme.small_size + 0.5)
+                    .color(theme.muted),
+            );
+            ui.add_space(8.0);
+            ui.label("URL");
+            ui.add(
+                egui::TextEdit::singleline(&mut state.url)
+                    .hint_text("https://example.com/file.zip")
+                    .desired_width(f32::INFINITY),
+            );
+            ui.add_space(6.0);
+            ui.label("Display name (optional)");
+            ui.add(egui::TextEdit::singleline(&mut state.name).desired_width(f32::INFINITY));
+            if let Some(error) = &state.error {
+                ui.add_space(4.0);
+                ui.label(RichText::new(error).color(theme.danger));
+            }
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if widgets::primary_button(ui, &theme, app.t(Key::Add_Download)).clicked() {
+                    queue = true;
+                }
+                if widgets::secondary_button(ui, &theme, app.t(Key::Downloads_Action_Cancel))
+                    .clicked()
+                {
+                    close = true;
+                }
+            });
+        });
+
+    if queue {
+        let url = state.url.trim().to_owned();
+        if !url.starts_with("http://") && !url.starts_with("https://") {
+            state.error = Some("Only http(s) URLs are supported.".to_owned());
+        } else {
+            let name = state.name.trim().to_owned();
+            app.send(Command::EnqueueUrlDownload {
+                url,
+                name: (!name.is_empty()).then_some(name),
+            });
+            state.url.clear();
+            state.name.clear();
+            state.error = None;
+            state.show_add = false;
+        }
+    }
+    if close {
+        state.show_add = false;
     }
 }
 
@@ -163,7 +257,7 @@ const fn status_tone(status: DownloadStatus) -> Tone {
 }
 
 /// App id and job kind shown under the title.
-fn subtitle(row: &DownloadSnapshot) -> String {
+fn subtitle(app: &AppState, row: &DownloadSnapshot) -> String {
     let kind = match row.request.kind {
         DownloadKind::Depot => match row.request.depots.len() {
             1 => "1 depot".to_owned(),
@@ -171,7 +265,10 @@ fn subtitle(row: &DownloadSnapshot) -> String {
         },
         DownloadKind::File => "File".to_owned(),
     };
-    format!("App {} · {kind}", row.request.app_id)
+    format!(
+        "{} · {kind}",
+        app.tf(Key::Common_AppFallback, &[&row.request.app_id.to_string()])
+    )
 }
 
 /// Size shown in history rows.
@@ -180,15 +277,15 @@ fn size_label(row: &DownloadSnapshot) -> String {
 }
 
 /// Progress, rate, and ETA in one line.
-fn metrics_text(row: &DownloadSnapshot) -> String {
+fn metrics_text(app: &AppState, row: &DownloadSnapshot) -> String {
     let mut text = row.progress_label();
     if row.bytes_per_second > 0 {
         text.push_str("  ·  ");
         text.push_str(&ByteFormat::new(row.bytes_per_second).per_second());
     }
     if let Some(seconds) = row.eta_seconds {
-        text.push_str("  ·  ETA ");
-        text.push_str(&format_eta(seconds));
+        text.push_str("  ·  ");
+        text.push_str(&app.tf(Key::Downloads_Eta, &[&format_eta(seconds)]));
     }
     text
 }
@@ -217,7 +314,7 @@ fn job_card(ui: &mut egui::Ui, app: &AppState, row: &DownloadSnapshot) {
                         .strong(),
                 );
                 ui.label(
-                    RichText::new(subtitle(row))
+                    RichText::new(subtitle(app, row))
                         .size(theme.small_size)
                         .color(theme.muted),
                 );
@@ -237,7 +334,7 @@ fn job_card(ui: &mut egui::Ui, app: &AppState, row: &DownloadSnapshot) {
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             ui.label(
-                RichText::new(metrics_text(row))
+                RichText::new(metrics_text(app, row))
                     .size(theme.small_size)
                     .color(theme.muted),
             );
@@ -292,7 +389,7 @@ fn history_row(ui: &mut egui::Ui, app: &AppState, row: &DownloadSnapshot) {
             ui.vertical(|ui| {
                 ui.label(RichText::new(&row.request.app_name).color(theme.text));
                 ui.label(
-                    RichText::new(subtitle(row))
+                    RichText::new(subtitle(app, row))
                         .size(theme.small_size)
                         .color(theme.muted),
                 );

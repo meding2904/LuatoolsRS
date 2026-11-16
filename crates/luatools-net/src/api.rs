@@ -5,8 +5,9 @@
 //! different subsystem and is deliberately absent.
 
 use luatools_core::{AppId, Error, Result};
+pub use luatools_core::{Featured, FeaturedItem, StoreSearchItem};
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::Value;
 
 /// The public Steam store origin.
@@ -17,37 +18,6 @@ pub const MAX_SEARCH_RESULTS: usize = 8;
 
 /// Maximum number of entries kept in each featured category.
 pub const MAX_FEATURED_ITEMS: usize = 20;
-
-/// One store search hit.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StoreSearchItem {
-    /// Store app id.
-    pub app_id: AppId,
-    /// Display name.
-    pub name: String,
-    /// Small capsule image, falling back to the conventional CDN URL.
-    pub icon: Option<String>,
-}
-
-/// One featured-store entry (top seller or new release).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FeaturedItem {
-    /// Store app id.
-    pub app_id: AppId,
-    /// Display name.
-    pub name: String,
-    /// Wide capsule image.
-    pub capsule_image: String,
-}
-
-/// The two featured categories the store page renders.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Featured {
-    /// Best-selling games.
-    pub top_sellers: Vec<FeaturedItem>,
-    /// Newly released games.
-    pub new_releases: Vec<FeaturedItem>,
-}
 
 /// The raw `data` object from Steam's appdetails response.
 ///
@@ -132,6 +102,86 @@ impl AppDetailsRaw {
             _ => None,
         }
     }
+
+    /// Parses the display metadata used by the library and store pages.
+    #[must_use]
+    pub fn metadata(&self) -> luatools_core::AppMetadata {
+        let release_date = self.release_date().map(str::to_owned);
+        let release_year = release_date.as_deref().and_then(release_year);
+        let platforms = self.data.get("platforms");
+        let content_ids = self
+            .data
+            .get("content_descriptors")
+            .and_then(|descriptors| descriptors.get("ids"))
+            .and_then(Value::as_array);
+        let is_adult = content_ids.is_some_and(|ids| {
+            ids.iter()
+                .any(|id| id.as_i64().is_some_and(|id| id == 3 || id == 4))
+        });
+        luatools_core::AppMetadata {
+            name: self.name().map(str::to_owned),
+            app_type: self.app_type().map(str::to_owned),
+            base_app_id: self.base_app_id(),
+            header_image: self.header_image().map(str::to_owned),
+            release_date,
+            release_year,
+            developers: string_array(&self.data, "developers"),
+            publishers: string_array(&self.data, "publishers"),
+            genres: self.genres(),
+            short_description: self.str_field("short_description").map(str::to_owned),
+            metacritic: self
+                .data
+                .get("metacritic")
+                .and_then(|value| value.get("score"))
+                .and_then(Value::as_i64)
+                .and_then(|score| i32::try_from(score).ok()),
+            reviews: self
+                .data
+                .get("recommendations")
+                .and_then(|value| value.get("total"))
+                .and_then(Value::as_i64),
+            is_free: self
+                .data
+                .get("is_free")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            is_adult,
+            windows: platforms
+                .and_then(|value| value.get("windows"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            mac: platforms
+                .and_then(|value| value.get("mac"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            linux: platforms
+                .and_then(|value| value.get("linux"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        }
+    }
+}
+
+fn release_year(text: &str) -> Option<i32> {
+    text.split(|ch: char| !ch.is_ascii_digit())
+        .filter(|part| part.len() == 4)
+        .find_map(|part| part.parse::<i32>().ok())
+        .filter(|year| (1900..=2100).contains(year))
+}
+
+fn string_array(data: &Value, key: &str) -> Vec<String> {
+    data.get(key)
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// A client bound to one store origin.

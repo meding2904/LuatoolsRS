@@ -4,7 +4,7 @@ use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::time::Instant;
 
 use luatools_core::{
-    AppDetails, AppId, BackendHandle, Command, DownloadId, DownloadSnapshot, Event,
+    AppDetails, AppId, AuthState, BackendHandle, Command, DownloadId, DownloadSnapshot, Event,
     LibrarySnapshot, LogLevel, PluginStatus, Settings, Toast, UpdateState,
 };
 use luatools_i18n::{Key, Translator};
@@ -54,12 +54,16 @@ const LOG_CAPACITY: usize = 500;
 pub struct Pages {
     /// Home dashboard.
     pub home: pages::home::State,
+    /// Store catalogue.
+    pub add: pages::add::State,
     /// Library/browse page.
     pub builds: pages::builds::State,
     /// Download queue.
     pub downloads: pages::downloads::State,
     /// App management page.
     pub manage: pages::manage::State,
+    /// Steam store plugin.
+    pub plugin: pages::plugin::State,
     /// Settings page.
     pub settings: pages::settings::State,
     /// First-run flow.
@@ -73,8 +77,12 @@ pub struct LaunchOptionsDialog {
     pub app_id: AppId,
     /// App name for the title.
     pub app_name: String,
-    /// Editable options string.
-    pub draft: String,
+    /// Structured Play-button entries.
+    pub entries: Vec<luatools_core::LaunchOption>,
+    /// Editable localconfig LaunchOptions string.
+    pub local_options: String,
+    /// Selected entry index.
+    pub selected: usize,
     /// Inline validation message.
     pub error: Option<String>,
 }
@@ -101,6 +109,8 @@ pub struct AppState {
     pub update: UpdateState,
     /// Plugin integration state.
     pub plugin: PluginStatus,
+    /// Authentication state.
+    pub auth: AuthState,
     /// On-screen toasts.
     pub toasts: Vec<ToastItem>,
     /// Long-running operations.
@@ -117,6 +127,12 @@ pub struct AppState {
     pub launch_options: Option<LaunchOptionsDialog>,
     /// Pending confirmation dialog.
     pub confirm: Option<ConfirmDialog>,
+    /// Set when the backend asks the shell to reveal the window.
+    pub show_window: bool,
+    /// Apps whose staged launch edits no longer match appinfo.
+    pub drifted_launches: Vec<AppId>,
+    /// Loaded cover textures, keyed by app.
+    covers: HashMap<AppId, egui::TextureHandle>,
 }
 
 /// A destructive action awaiting confirmation.
@@ -138,6 +154,11 @@ impl AppState {
     pub fn new(backend: BackendHandle, settings: Settings) -> Self {
         let dark_mode = !matches!(settings.theme, luatools_core::ThemePreference::Light);
         let i18n = Translator::new(settings.language);
+        let page = settings
+            .last_page
+            .as_deref()
+            .and_then(Page::from_id)
+            .unwrap_or(Page::Home);
         Self {
             backend,
             theme: if dark_mode {
@@ -153,14 +174,18 @@ impl AppState {
             downloads: Vec::new(),
             update: UpdateState::Idle,
             plugin: PluginStatus::NotInstalled,
+            auth: AuthState::Guest,
             toasts: Vec::new(),
             busy: BTreeSet::new(),
             logs: VecDeque::with_capacity(64),
-            page: Page::Home,
+            page,
             search: String::new(),
             pages: Pages::default(),
             launch_options: None,
             confirm: None,
+            show_window: false,
+            drifted_launches: Vec::new(),
+            covers: HashMap::new(),
         }
     }
 
@@ -238,17 +263,45 @@ impl AppState {
         let Some(app) = self.snapshot.app(id) else {
             return;
         };
-        let current = self
-            .details
-            .get(&id)
-            .map(|d| d.launch_options.clone())
-            .unwrap_or_default();
+        let Some(details) = self.details.get(&id) else {
+            return;
+        };
         self.launch_options = Some(LaunchOptionsDialog {
             app_id: id,
             app_name: app.name.clone(),
-            draft: current,
+            entries: details.launch_entries.clone(),
+            local_options: details.launch_options.clone(),
+            selected: 0,
             error: None,
         });
+    }
+
+    /// Loads a cover texture from disk, caching it by app id.
+    pub fn cover_texture(
+        &mut self,
+        ctx: &egui::Context,
+        app_id: AppId,
+        path: Option<&std::path::Path>,
+    ) -> Option<egui::TextureHandle> {
+        if let Some(texture) = self.covers.get(&app_id) {
+            return Some(texture.clone());
+        }
+        let path = path?;
+        let image = image::open(path).ok()?.to_rgba8();
+        let size = [image.width() as usize, image.height() as usize];
+        let pixels = image.into_raw();
+        let texture = ctx.load_texture(
+            format!("cover-{app_id}"),
+            egui::ColorImage::from_rgba_unmultiplied(size, &pixels),
+            egui::TextureOptions::LINEAR,
+        );
+        self.covers.insert(app_id, texture.clone());
+        Some(texture)
+    }
+
+    /// Drops a cached cover so the next frame reloads it.
+    pub fn invalidate_cover(&mut self, app_id: AppId) {
+        self.covers.remove(&app_id);
     }
 
     /// Pushes a toast, keeping the newest four.
@@ -275,6 +328,62 @@ impl AppState {
             Event::AppDetailsLoaded(details) => {
                 self.details.insert(details.app.id, *details);
             }
+            Event::StoreDetailsLoaded(details) => {
+                self.pages.add.selected = Some(details.app.id);
+                self.pages.add.searching = false;
+                self.details.insert(details.app.id, *details);
+            }
+            Event::StoreSearchResults { query, items } => {
+                if query == self.pages.add.last_query {
+                    self.pages.add.results = items;
+                    self.pages.add.searching = false;
+                }
+            }
+            Event::FeaturedLoaded(featured) => {
+                self.pages.add.featured = *featured;
+            }
+            Event::AppMetadataLoaded { app_id, metadata } => {
+                if let Some(entry) = self
+                    .snapshot
+                    .apps
+                    .iter_mut()
+                    .find(|entry| entry.id == app_id)
+                {
+                    apply_metadata(entry, &metadata);
+                }
+                if let Some(details) = self.details.get_mut(&app_id) {
+                    apply_metadata(&mut details.app, &metadata);
+                    details.metadata = Some(*metadata);
+                }
+            }
+            Event::DepotInfoLoaded(info) => {
+                if let Some(details) = self.details.get_mut(&info.app_id) {
+                    details.apply_depot_info(&info);
+                }
+            }
+            Event::CoverUpdated { app_id, path } => {
+                if let Some(entry) = self
+                    .snapshot
+                    .apps
+                    .iter_mut()
+                    .find(|entry| entry.id == app_id)
+                {
+                    entry.cover_path = Some(path.clone());
+                }
+                if let Some(details) = self.details.get_mut(&app_id) {
+                    details.app.cover_path = Some(path);
+                }
+                self.invalidate_cover(app_id);
+            }
+            Event::LaunchOptionsDrifted(apps) => self.drifted_launches = apps,
+            Event::AuthState(state) => {
+                if let AuthState::Failed { reason } = &state {
+                    self.push_toast(Toast::error(reason.clone()));
+                }
+                self.auth = state;
+            }
+            Event::Navigate(target) => self.page = Page::from_nav(target),
+            Event::ShowWindow => self.show_window = true,
             Event::DownloadUpdated(snapshot) => {
                 let snapshot = *snapshot;
                 match self.downloads.iter_mut().find(|d| d.id == snapshot.id) {
@@ -291,11 +400,14 @@ impl AppState {
             Event::SettingsSaved(settings) => {
                 self.settings = *settings;
                 self.i18n.set_locale(self.settings.language);
+                self.pages.settings.draft = None;
+                self.pages.settings.dirty = false;
             }
             Event::LaunchOptionsSaved(app_id) => {
                 if let Some(details) = self.details.get_mut(&app_id) {
                     if let Some(dialog) = self.launch_options.take() {
-                        details.launch_options = dialog.draft;
+                        details.launch_entries = dialog.entries;
+                        details.launch_options = dialog.local_options;
                     }
                 } else {
                     self.launch_options = None;
@@ -335,6 +447,19 @@ impl AppState {
             }
         }
     }
+}
+
+fn apply_metadata(entry: &mut luatools_core::AppEntry, metadata: &luatools_core::AppMetadata) {
+    if let Some(name) = metadata.name.as_deref()
+        && !name.trim().is_empty()
+    {
+        entry.name = name.trim().to_owned();
+    }
+    entry.cover_url = metadata.header_image.clone();
+    entry.release_date = metadata.release_date.clone();
+    entry.developer = (!metadata.developers.is_empty()).then(|| metadata.developer_label());
+    entry.genres = metadata.genres.clone();
+    entry.metadata = Some(metadata.clone());
 }
 
 #[cfg(test)]
@@ -448,5 +573,44 @@ mod tests {
         state.set_locale(luatools_core::Locale::Fr);
         assert_eq!(state.i18n.locale(), luatools_core::Locale::Fr);
         assert_eq!(state.settings.language, luatools_core::Locale::Fr);
+    }
+    #[test]
+    fn metadata_and_navigation_events_update_state() {
+        let mut state = state();
+        state.apply_event(Event::LibraryRefreshed(Box::new(LibrarySnapshot {
+            apps: vec![AppEntry::new(AppId::new(730), "730")],
+            ..LibrarySnapshot::default()
+        })));
+        state.apply_event(Event::AppMetadataLoaded {
+            app_id: AppId::new(730),
+            metadata: Box::new(luatools_core::AppMetadata {
+                name: Some("Counter-Strike 2".to_owned()),
+                header_image: Some("https://cdn/730.jpg".to_owned()),
+                release_year: Some(2012),
+                genres: vec!["Action".to_owned()],
+                ..luatools_core::AppMetadata::default()
+            }),
+        });
+        let entry = state.snapshot.app(AppId::new(730)).expect("entry");
+        assert_eq!(entry.name, "Counter-Strike 2");
+        assert_eq!(entry.cover_url.as_deref(), Some("https://cdn/730.jpg"));
+        assert_eq!(
+            entry.metadata.as_ref().and_then(|m| m.release_year),
+            Some(2012)
+        );
+        state.apply_event(Event::Navigate(luatools_core::NavTarget::Add));
+        assert_eq!(state.page, Page::Add);
+        state.apply_event(Event::ShowWindow);
+        assert!(state.show_window);
+    }
+
+    #[test]
+    fn failed_auth_becomes_a_toast() {
+        let mut state = state();
+        state.apply_event(Event::AuthState(AuthState::Failed {
+            reason: "not configured".to_owned(),
+        }));
+        assert_eq!(state.toasts.len(), 1);
+        assert!(matches!(state.auth, AuthState::Failed { .. }));
     }
 }

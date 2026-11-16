@@ -5,7 +5,10 @@ use std::path::PathBuf;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::depot::AppDepotInfo;
 use crate::ids::{AppId, DepotId, ManifestId};
+use crate::launch::LaunchOption;
+use crate::store::AppMetadata;
 
 /// Whether an application is present on disk.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -64,6 +67,9 @@ pub struct AppEntry {
     /// Cover image URL, when the API provided one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cover_url: Option<String>,
+    /// Local cover image path, when one was found or downloaded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cover_path: Option<PathBuf>,
     /// Release date as a display string.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub release_date: Option<String>,
@@ -79,6 +85,9 @@ pub struct AppEntry {
     /// Total playtime in minutes.
     #[serde(default)]
     pub playtime_minutes: u32,
+    /// Full store metadata, when it has been resolved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<AppMetadata>,
 }
 
 impl AppEntry {
@@ -90,11 +99,13 @@ impl AppEntry {
             name: name.into(),
             installed: InstalledState::NotInstalled,
             cover_url: None,
+            cover_path: None,
             release_date: None,
             developer: None,
             genres: Vec::new(),
             last_played: None,
             playtime_minutes: 0,
+            metadata: None,
         }
     }
 
@@ -129,10 +140,53 @@ pub struct DepotEntry {
     /// Whether the user enabled this depot in the UI.
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Declared OS list, e.g. `windows`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub os: Option<String>,
+    /// Declared depot language.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    /// DLC app that owns this depot, when it ships DLC files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dlc_app_id: Option<AppId>,
+    /// Owning app for a shared redistributable depot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_app_id: Option<AppId>,
+    /// True for a shared redistributable depot.
+    #[serde(default)]
+    pub is_shared: bool,
+    /// Public-branch build id for the depot's app.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_id: Option<String>,
+    /// Public manifest currently shipped by Steam.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_manifest_id: Option<ManifestId>,
 }
 
 const fn default_true() -> bool {
     true
+}
+
+impl DepotEntry {
+    /// Builds a minimal enabled depot row.
+    #[must_use]
+    pub fn new(id: DepotId, name: impl Into<String>) -> Self {
+        Self {
+            id,
+            name: name.into(),
+            size: None,
+            manifest_id: None,
+            optional: false,
+            enabled: true,
+            os: None,
+            language: None,
+            dlc_app_id: None,
+            from_app_id: None,
+            is_shared: false,
+            build_id: None,
+            public_manifest_id: None,
+        }
+    }
 }
 
 /// Everything the app detail pane needs.
@@ -144,9 +198,18 @@ pub struct AppDetails {
     /// Depots belonging to the app.
     #[serde(default)]
     pub depots: Vec<DepotEntry>,
-    /// Steam launch options string currently configured.
+    /// Steam launch options string currently configured in `localconfig.vdf`.
     #[serde(default)]
     pub launch_options: String,
+    /// Structured Play-button entries read from `appinfo.vdf`.
+    #[serde(default)]
+    pub launch_entries: Vec<LaunchOption>,
+    /// Cached store metadata, when it has been resolved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<AppMetadata>,
+    /// Cached depot information from the public metadata service.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub depot_info: Option<AppDepotInfo>,
     /// Install directory name from the app manifest.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub install_dir: Option<String>,
@@ -163,6 +226,9 @@ impl AppDetails {
             app,
             depots: Vec::new(),
             launch_options: String::new(),
+            launch_entries: Vec::new(),
+            metadata: None,
+            depot_info: None,
             install_dir: None,
             library_found: true,
         }
@@ -172,6 +238,47 @@ impl AppDetails {
     #[must_use]
     pub fn total_depot_size(&self) -> u64 {
         self.depots.iter().filter_map(|d| d.size).sum()
+    }
+
+    /// Returns the depot row with the given id.
+    #[must_use]
+    pub fn depot(&self, id: DepotId) -> Option<&DepotEntry> {
+        self.depots.iter().find(|depot| depot.id == id)
+    }
+
+    /// Merges public depot metadata into the detail rows.
+    ///
+    /// Rows already declared by appinfo keep their names; missing rows are created with a
+    /// generic name so the interface can still show their size and id.
+    pub fn apply_depot_info(&mut self, info: &AppDepotInfo) {
+        self.depot_info = Some(info.clone());
+        for content in &info.depots {
+            let entry = if let Some(entry) = self.depots.iter_mut().find(|d| d.id == content.id) {
+                entry
+            } else {
+                self.depots.push(DepotEntry::new(
+                    content.id,
+                    format!("Depot {}", content.id.get()),
+                ));
+                // The row was just pushed, so this lookup always succeeds.
+                let Some(entry) = self.depots.last_mut() else {
+                    continue;
+                };
+                entry
+            };
+            entry.size = (content.size > 0).then_some(content.size);
+            entry.public_manifest_id = content.public_manifest_id;
+            entry.os = content.os.clone();
+            entry.language = content.language.clone();
+            entry.dlc_app_id = content.dlc_app_id;
+            entry.from_app_id = content.from_app_id;
+            entry.is_shared = content.is_shared;
+            entry.build_id = info.public_build_id.clone();
+            if content.is_dlc() {
+                entry.optional = true;
+            }
+        }
+        self.depots.sort_by_key(|depot| depot.id);
     }
 }
 
@@ -258,23 +365,56 @@ mod tests {
     fn details_total_sums_known_depot_sizes_only() {
         let mut details = AppDetails::new(AppEntry::new(AppId::new(1), "x"));
         details.depots = vec![
-            DepotEntry {
-                id: DepotId::new(2),
-                name: "a".into(),
-                size: Some(100),
-                manifest_id: None,
-                optional: false,
-                enabled: true,
+            {
+                let mut depot = DepotEntry::new(DepotId::new(2), "a");
+                depot.size = Some(100);
+                depot
             },
-            DepotEntry {
-                id: DepotId::new(3),
-                name: "b".into(),
-                size: None,
-                manifest_id: None,
-                optional: false,
-                enabled: true,
-            },
+            DepotEntry::new(DepotId::new(3), "b"),
         ];
         assert_eq!(details.total_depot_size(), 100);
+    }
+    #[test]
+    fn depot_info_merges_by_id_and_creates_missing_rows() {
+        let mut details = AppDetails::new(AppEntry::new(AppId::new(1), "x"));
+        details.depots = vec![DepotEntry::new(DepotId::new(2), "Existing")];
+        let info = AppDepotInfo {
+            app_id: AppId::new(1),
+            depots: vec![
+                crate::depot::ContentDepot {
+                    id: DepotId::new(2),
+                    size: 42,
+                    dlc_app_id: None,
+                    is_shared: false,
+                    os: Some("windows".to_owned()),
+                    language: None,
+                    public_manifest_id: Some(ManifestId::new(9)),
+                    from_app_id: None,
+                },
+                crate::depot::ContentDepot {
+                    id: DepotId::new(3),
+                    size: 0,
+                    dlc_app_id: Some(AppId::new(4)),
+                    is_shared: true,
+                    os: None,
+                    language: Some("english".to_owned()),
+                    public_manifest_id: None,
+                    from_app_id: Some(AppId::new(5)),
+                },
+            ],
+            dlc_ids: vec![AppId::new(4)],
+            launch_exes: Vec::new(),
+            public_build_id: Some("1234".to_owned()),
+        };
+        details.apply_depot_info(&info);
+        assert_eq!(details.depots.len(), 2);
+        let existing = details.depot(DepotId::new(2)).expect("existing row");
+        assert_eq!(existing.name, "Existing");
+        assert_eq!(existing.size, Some(42));
+        assert_eq!(existing.build_id.as_deref(), Some("1234"));
+        let created = details.depot(DepotId::new(3)).expect("created row");
+        assert!(created.is_shared);
+        assert!(created.optional);
+        assert_eq!(created.from_app_id, Some(AppId::new(5)));
     }
 }

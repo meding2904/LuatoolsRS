@@ -72,6 +72,8 @@ pub struct Settings {
     pub close_behavior: CloseBehavior,
     /// Start hidden in the tray.
     pub start_minimized: bool,
+    /// Register the application to start with the operating system.
+    pub start_with_os: bool,
 
     // Downloads.
     /// Default destination for new downloads.
@@ -120,6 +122,7 @@ impl Default for Settings {
             last_page: None,
             close_behavior: CloseBehavior::default(),
             start_minimized: false,
+            start_with_os: false,
             download_dir: default_download_dir(),
             scheduling: DownloadScheduling::default(),
             max_concurrent_downloads: 3,

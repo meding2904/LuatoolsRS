@@ -1,8 +1,8 @@
-# LuaTools (Rust)
+# LuatoolsRS
 
 A Rust rewrite of [LuaTools](https://github.com/madoiscool/LuaTools) — a desktop client for
-inspecting Steam libraries, managing depot metadata, editing launch options, and downloading
-content you own — with a GPU-rendered interface built on `egui`/`eframe` (wgpu).
+inspecting Steam libraries, managing depot metadata, editing launch options, and transferring
+files — with a GPU-rendered interface built on `egui`/`eframe` (wgpu).
 
 > **Scope note.** This rewrite covers the legitimate Steam client features only. The original
 > application's Steam DRM circumvention features (stplug-in ownership spoofing, unlocker mode
@@ -28,26 +28,30 @@ These are rendered by the real UI code through offscreen wgpu, not mockups.
 
 | Area | Status |
 |---|---|
-| Steam library discovery (`libraryfolders.vdf`, `appmanifest_*.acf`) | working |
-| Text and binary VDF, `appinfo.vdf`, depot manifest parsing | working |
-| Launch options: read from appinfo/localconfig, edit, apply | writes `localconfig.vdf` (backup kept); restart Steam |
-| Download queue: pause, resume, cancel, retry, history | working for file URLs |
+| Steam library discovery (`libraryfolders.vdf`, `appmanifest_*.acf`) | working, including extra library roots |
+| Text and binary VDF, `appinfo.vdf`, zipped depot manifests, depot-key format checks | working |
+| Store catalogue: search, featured strips, details, covers, metadata filters | working (Add page) |
+| Depot metadata: sizes, public manifests/builds, OS, language, DLC, shared depots | working |
+| Launch options: appinfo entries + localconfig, add/remove/reorder, backup/restore | working; Steam is stopped/restarted when appinfo is rewritten |
+| Download queue: pause, resume, cancel, retry, history, verify, speed limit | working for file URLs; destination is the configured download folder |
 | App install/update hand-off | opens `steam://install/<id>` and the store page |
-| Steam store search / app metadata client | implemented, not surfaced in the UI yet |
-| Multi-language UI (English + 29 translations) | working |
-| Settings, cache, atomic persistence, single instance, protocol handoff | working |
-| Startup library scan | automatic; manual refresh also available |
-| Updater check (GitHub releases) | check only; installation is package-manager work |
-| Millennium/Steam store plugin installer | trait + server surface; platform installer not implemented |
-| Local plugin API server | loopback + token, three routes |
-| Tray icon | not implemented; the window closes normally |
+| Multi-language UI (English + 29 translations) | typed locale keys throughout; newer labels fall back to English when no translation exists |
+| Settings, cache, atomic persistence, single instance, protocol registration/handoff | working |
+| Tray icon, close-to-tray, start minimized, start with the OS | working (tray backend is native on each platform) |
+| Updater | checks GitHub releases and stages the platform asset; installation is left to the package manager |
+| Steam store plugin | Windows installer/manager, Plugin page, CEF store-page injection, loopback plugin API with three routes |
+| Authentication | configurable Supabase/Discord PKCE flow; guest mode when unconfigured |
 | System fonts | CJK, Thai and Arabic fallbacks loaded from the OS |
 | Native folder picker | XDG portal on Linux, native dialogs on Windows/macOS |
 | Themes | dark by default; light palette available |
 
 Known limitations: Arabic is rendered left-to-right without joining (egui has no text shaping);
-the Steam plugin installer and tray are not implemented; depot-content downloads are out of
-scope (the app hands installs to Steam, and its download queue transfers plain files).
+depot-content downloads are out of scope (the app hands installs to Steam, and its download
+queue transfers plain files); the Steam plugin loader is Windows-only; updates are staged for a
+package manager rather than self-installed; sign-in needs `LUATOOLS_SUPABASE_URL` and
+`LUATOOLS_SUPABASE_ANON_KEY` at runtime; queue-wide verification/speed/concurrency and the local
+API port take effect on the next launch. On Linux, close-to-tray needs a StatusNotifier/
+AppIndicator host; without one the tray icon will not appear.
 
 ## Layout
 
@@ -78,10 +82,11 @@ Windows the app uses D3D12 through wgpu.
 
 ## Architecture
 
-The interface is immediate mode and stateless with respect to I/O. It renders from `AppState`,
-sends `Command` values through a channel, and folds `Event` values back into state each frame.
-The backend actor owns the Tokio runtime, the Steam probing, the network, and the download
-queue. Nothing blocks the UI thread, and every screen is testable with a disconnected handle.
+The interface is immediate mode and stateless with respect to backend/network I/O. It renders
+from `AppState`, sends `Command` values through a channel, and folds `Event` values back into
+state each frame. It only reads local cover images and dropped files. The backend actor owns
+the Tokio runtime, the Steam probing, the network, and the download queue. Network work never
+blocks the UI thread, and every screen is testable with a disconnected handle.
 
 See `docs/port-spec.md` for the module contracts and `docs/egui-0.37-api.md` for the UI API
 cheat-sheet used by the port.

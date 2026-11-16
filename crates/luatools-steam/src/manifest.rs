@@ -11,11 +11,14 @@
 //! sections (including the signature) are skipped.
 //!
 //! This module parses the payload too, so callers can list a depot's files without a
-//! separate protobuf dependency. It deliberately does not decrypt encrypted filenames: the
-//! paths are returned exactly as stored (Base64 while encrypted).
+//! separate protobuf dependency. Paths are returned exactly as stored (Base64 while their
+//! filenames are encrypted). [`key_looks_valid`] can optionally test a depot key against
+//! the first encrypted filename; no download or depot-key pipeline lives here.
 
+use std::io::{Cursor, Read as _};
 use std::path::Path;
 
+use base64::Engine as _;
 use luatools_core::{DepotId, Error, ManifestId, Result};
 
 /// Section magic for `ContentManifestPayload`.
@@ -47,6 +50,8 @@ pub struct Manifest {
     pub gid: ManifestId,
     /// Creation time as a Unix timestamp.
     pub creation: u64,
+    /// True when the payload's filenames are Base64-encoded ciphertext.
+    pub filenames_encrypted: bool,
     /// Files described by the payload section. Empty when the payload was omitted.
     pub files: Vec<ManifestFile>,
     /// Installed size from the metadata section, falling back to the sum of file sizes.
@@ -57,33 +62,30 @@ pub struct Manifest {
 ///
 /// A missing payload section is accepted (the metadata-only manifests used by Steam's
 /// cache migration are valid); a missing metadata section is an error because the depot
-/// identity is unknown.
+/// identity is unknown. A ZIP container (first two bytes `PK`) is inflated whole and its
+/// first entry is used, matching Steam's zipped manifests.
 ///
 /// # Errors
 ///
-/// Returns a parse error for a truncated section, a missing metadata section, an
-/// over-long protobuf varint, an unsupported protobuf group, or a zipped manifest.
+/// Returns a parse error for an invalid ZIP archive, a truncated section, a missing
+/// metadata section, an over-long protobuf varint, or an unsupported protobuf group.
 pub fn parse_manifest(bytes: &[u8]) -> Result<Manifest> {
-    // shortcut: the C# reader inflates a zipped manifest's first entry. This crate's API
-    // takes uncompressed manifest bytes, so a ZIP container is rejected instead of being
-    // parsed as a section stream. Callers holding a `.manifest` that starts with "PK"
-    // should inflate it before calling.
-    if bytes.starts_with(b"PK") {
-        return Err(Error::parse(
-            "manifest",
-            "zipped manifests are not supported; inflate the archive first",
-        ));
-    }
+    let inflated = if bytes.starts_with(b"PK") {
+        Some(inflate_zip(bytes)?)
+    } else {
+        None
+    };
+    let data = inflated.as_deref().unwrap_or(bytes);
 
     let mut metadata = None;
     let mut files = None;
     let mut position = 0usize;
 
-    while position < bytes.len() {
+    while position < data.len() {
         let header_end = position
             .checked_add(8)
             .ok_or_else(|| Error::parse("manifest", "section header offset overflow"))?;
-        let header = bytes.get(position..header_end).ok_or_else(|| {
+        let header = data.get(position..header_end).ok_or_else(|| {
             Error::parse(
                 "manifest",
                 format!("truncated section header at offset {position}"),
@@ -102,7 +104,7 @@ pub fn parse_manifest(bytes: &[u8]) -> Result<Manifest> {
         let section_end = position
             .checked_add(length)
             .ok_or_else(|| Error::parse("manifest", "section length overflow"))?;
-        let section = bytes.get(position..section_end).ok_or_else(|| {
+        let section = data.get(position..section_end).ok_or_else(|| {
             Error::parse(
                 "manifest",
                 format!("truncated section at offset {position} (length {length})"),
@@ -131,6 +133,7 @@ pub fn parse_manifest(bytes: &[u8]) -> Result<Manifest> {
         depot_id: DepotId::new(metadata.depot_id),
         gid: ManifestId::new(metadata.gid),
         creation: u64::from(metadata.creation),
+        filenames_encrypted: metadata.filenames_encrypted,
         files,
         total_size,
     })
@@ -148,11 +151,108 @@ pub fn matches(path: &Path, depot: DepotId, gid: ManifestId) -> bool {
     parse_manifest(&bytes).is_ok_and(|manifest| manifest.depot_id == depot && manifest.gid == gid)
 }
 
+/// Tests whether a depot key can plausibly decrypt the manifest's first filename.
+///
+/// This is the format-level key check used before a depot download. It deliberately
+/// reports `true` when there is nothing to test: an unreadable file, a key that is not 32
+/// bytes, a manifest without encrypted filenames, no payload section, no Base64 filename,
+/// or a ciphertext of the wrong shape. It returns `false` only when a filename was
+/// testable and AES-256-CBC decryption produced invalid PKCS#7 padding or control bytes.
+///
+/// A wrong key can still pass by chance (valid padding and printable plaintext), so a
+/// `true` result is "no objection", not proof that the key is correct.
+#[must_use]
+pub fn key_looks_valid(path: &Path, key: &[u8]) -> bool {
+    let Ok(bytes) = std::fs::read(path) else {
+        return true;
+    };
+    key_looks_valid_bytes(&bytes, key)
+}
+
+/// [`key_looks_valid`] over manifest bytes already in memory.
+///
+/// Zipped manifests are inflated first, as in [`parse_manifest`].
+#[must_use]
+pub fn key_looks_valid_bytes(bytes: &[u8], key: &[u8]) -> bool {
+    if key.len() != 32 {
+        return true;
+    }
+    let Ok(manifest) = parse_manifest(bytes) else {
+        return true;
+    };
+    if !manifest.filenames_encrypted {
+        return true;
+    }
+    let Some(first) = manifest.files.first() else {
+        return true;
+    };
+    let Ok(ciphertext) = base64::engine::general_purpose::STANDARD.decode(first.path.as_bytes())
+    else {
+        return true;
+    };
+    if ciphertext.len() <= 16 || !ciphertext.len().is_multiple_of(16) {
+        return true;
+    }
+    let Some(plaintext) = decrypt_encrypted_filename(&ciphertext, key) else {
+        return false;
+    };
+    !plaintext.iter().any(|byte| *byte < 0x20 && *byte != 0x00)
+}
+
+/// Decrypts one Steam manifest filename with a 32-byte depot key.
+///
+/// The first 16 ciphertext bytes are the IV encrypted with AES-256-ECB; the remainder is
+/// AES-256-CBC with PKCS#7 padding. Returns `None` for a wrong key length, an impossible
+/// ciphertext length, or invalid padding. Control-byte validation is the caller's job (see
+/// [`key_looks_valid`]).
+#[must_use]
+pub fn decrypt_encrypted_filename(ciphertext: &[u8], key: &[u8]) -> Option<Vec<u8>> {
+    use aes::cipher::block_padding::Pkcs7;
+    use aes::cipher::generic_array::GenericArray;
+    use aes::cipher::{BlockDecrypt, BlockDecryptMut, KeyInit, KeyIvInit};
+
+    if key.len() != 32 || ciphertext.len() <= 16 || !ciphertext.len().is_multiple_of(16) {
+        return None;
+    }
+    let key: [u8; 32] = key.try_into().ok()?;
+    let (iv_ciphertext, body) = ciphertext.split_at(16);
+
+    let mut iv = GenericArray::clone_from_slice(iv_ciphertext);
+    let ecb = <aes::Aes256 as KeyInit>::new_from_slice(&key).ok()?;
+    ecb.decrypt_block(&mut iv);
+
+    let mut buffer = body.to_vec();
+    let decryptor =
+        <cbc::Decryptor<aes::Aes256> as KeyIvInit>::new_from_slices(&key, iv.as_slice()).ok()?;
+    let plaintext = decryptor.decrypt_padded_mut::<Pkcs7>(&mut buffer).ok()?;
+    Some(plaintext.to_vec())
+}
+
+fn inflate_zip(bytes: &[u8]) -> Result<Vec<u8>> {
+    let mut archive = zip::ZipArchive::new(Cursor::new(bytes))
+        .map_err(|error| Error::parse("manifest", format!("invalid zipped manifest: {error}")))?;
+    if archive.is_empty() {
+        return Ok(bytes.to_vec());
+    }
+    let mut entry = archive.by_index(0).map_err(|error| {
+        Error::parse(
+            "manifest",
+            format!("reading the first zipped manifest entry: {error}"),
+        )
+    })?;
+    let mut contents = Vec::new();
+    entry
+        .read_to_end(&mut contents)
+        .map_err(|error| Error::io("inflating zipped manifest", error))?;
+    Ok(contents)
+}
+
 #[derive(Debug, Clone, Copy)]
 struct Metadata {
     depot_id: u32,
     gid: u64,
     creation: u32,
+    filenames_encrypted: bool,
     size_on_disk: u64,
 }
 
@@ -162,6 +262,7 @@ fn parse_metadata(data: &[u8]) -> Result<Metadata> {
         depot_id: 0,
         gid: 0,
         creation: 0,
+        filenames_encrypted: false,
         size_on_disk: 0,
     };
 
@@ -177,9 +278,7 @@ fn parse_metadata(data: &[u8]) -> Result<Metadata> {
                 metadata.creation = u32::try_from(reader.read_varint()?)
                     .map_err(|_| reader.error("creation time does not fit in u32"))?;
             }
-            (4, 0) => {
-                reader.read_varint()?;
-            }
+            (4, 0) => metadata.filenames_encrypted = reader.read_varint()? != 0,
             (5, 0) => metadata.size_on_disk = reader.read_varint()?,
             _ => reader.skip(wire)?,
         }
@@ -344,6 +443,10 @@ impl<'a> ProtoReader<'a> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use aes::cipher::block_padding::Pkcs7;
+    use aes::cipher::generic_array::GenericArray;
+    use aes::cipher::{BlockEncrypt, BlockEncryptMut, KeyInit, KeyIvInit};
+    use std::io::Write as _;
 
     fn varint(mut value: u64) -> Vec<u8> {
         let mut bytes = Vec::new();
@@ -407,6 +510,51 @@ mod tests {
         manifest
     }
 
+    fn zip_manifest(entries: &[&[u8]]) -> Vec<u8> {
+        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        for (index, entry) in entries.iter().enumerate() {
+            writer
+                .start_file(
+                    format!("{index}.manifest"),
+                    zip::write::SimpleFileOptions::default()
+                        .compression_method(zip::CompressionMethod::Stored),
+                )
+                .unwrap();
+            writer.write_all(entry).unwrap();
+        }
+        writer.finish().unwrap().into_inner()
+    }
+
+    fn encrypt_filename(name: &[u8], key: &[u8; 32], iv: &[u8; 16]) -> Vec<u8> {
+        let ecb = aes::Aes256::new_from_slice(key).unwrap();
+        let mut iv_block = GenericArray::clone_from_slice(iv);
+        ecb.encrypt_block(&mut iv_block);
+
+        let encryptor =
+            <cbc::Encryptor<aes::Aes256> as KeyIvInit>::new_from_slices(key, iv).unwrap();
+        let ciphertext = encryptor.encrypt_padded_vec_mut::<Pkcs7>(name);
+
+        let mut output = iv_block.to_vec();
+        output.extend_from_slice(&ciphertext);
+        output
+    }
+
+    fn encrypted_fixture(name: &[u8], key: &[u8; 32], iv: &[u8; 16]) -> Vec<u8> {
+        let filename =
+            base64::engine::general_purpose::STANDARD.encode(encrypt_filename(name, key, iv));
+        let mut mapping = bytes_field(1, filename.as_bytes());
+        mapping.extend(varint_field(2, 1234));
+        let payload = bytes_field(1, &mapping);
+
+        let mut metadata = varint_field(1, 730);
+        metadata.extend(varint_field(2, 99));
+        metadata.extend(varint_field(4, 1));
+
+        let mut manifest = section(PAYLOAD_MAGIC, &payload);
+        manifest.extend(section(METADATA_MAGIC, &metadata));
+        manifest
+    }
+
     #[test]
     fn parses_payload_and_metadata_concrete_values() {
         let manifest = parse_manifest(&fixture()).unwrap();
@@ -461,7 +609,7 @@ mod tests {
         assert!(error.contains("truncated section"), "{error}");
 
         let error = parse_manifest(b"PK\x03\x04rest").unwrap_err().to_string();
-        assert!(error.contains("zipped manifests"), "{error}");
+        assert!(error.contains("zipped manifest"), "{error}");
     }
 
     #[test]
@@ -500,5 +648,123 @@ mod tests {
         let bytes = section(METADATA_MAGIC, &group);
         let error = parse_manifest(&bytes).unwrap_err().to_string();
         assert!(error.contains("wire type 3"), "{error}");
+    }
+
+    #[test]
+    fn parses_the_first_entry_of_a_zipped_manifest() {
+        let first = fixture();
+        let mut other_metadata = varint_field(1, 440);
+        other_metadata.extend(varint_field(2, 1));
+        let other = section(METADATA_MAGIC, &other_metadata);
+        let zipped = zip_manifest(&[&first, &other]);
+
+        let manifest = parse_manifest(&zipped).unwrap();
+        assert_eq!(manifest.depot_id, DepotId::new(730));
+        assert_eq!(manifest.files.len(), 1);
+        assert_eq!(manifest.files[0].path, "game/bin/linuxsteamrt64/cs2");
+        assert!(!manifest.filenames_encrypted);
+
+        let empty = zip_manifest(&[]);
+        assert!(parse_manifest(&empty).is_err());
+    }
+
+    #[test]
+    fn matches_accepts_zipped_manifests() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("730_7649880572861247491.manifest");
+        std::fs::write(&path, zip_manifest(&[&fixture()])).unwrap();
+        assert!(matches(
+            &path,
+            DepotId::new(730),
+            ManifestId::new(7_649_880_572_861_247_491)
+        ));
+    }
+
+    #[test]
+    fn key_check_accepts_the_right_key_and_rejects_the_wrong_one() {
+        let key = [0x42; 32];
+        let iv = [0x11; 16];
+        let bytes = encrypted_fixture(b"game/bin/linuxsteamrt64/cs2", &key, &iv);
+
+        let manifest = parse_manifest(&bytes).unwrap();
+        assert!(manifest.filenames_encrypted);
+        assert!(key_looks_valid_bytes(&bytes, &key));
+        assert!(!key_looks_valid_bytes(&bytes, &[0x43; 32]));
+        assert!(key_looks_valid_bytes(&bytes, &[0x42; 31]));
+
+        // Zipped input is inflated before the check.
+        let zipped = zip_manifest(&[&bytes]);
+        assert!(key_looks_valid_bytes(&zipped, &key));
+        assert!(!key_looks_valid_bytes(&zipped, &[0x43; 32]));
+    }
+
+    #[test]
+    fn key_check_has_no_objection_without_something_testable() {
+        let key = [0x42; 32];
+        let iv = [0x11; 16];
+
+        // Filenames are not encrypted.
+        assert!(key_looks_valid_bytes(&fixture(), &key));
+
+        // Encrypted but no payload, no files, or an empty filename.
+        let mut metadata = varint_field(1, 730);
+        metadata.extend(varint_field(2, 99));
+        metadata.extend(varint_field(4, 1));
+        let metadata_only = section(METADATA_MAGIC, &metadata);
+        assert!(key_looks_valid_bytes(&metadata_only, &key));
+
+        // First filename is not Base64.
+        let mapping = bytes_field(1, b"not base64!!!");
+        let payload = bytes_field(1, &mapping);
+        let mut not_base64 = section(PAYLOAD_MAGIC, &payload);
+        not_base64.extend(section(METADATA_MAGIC, &metadata));
+        assert!(key_looks_valid_bytes(&not_base64, &key));
+
+        // Ciphertext is too short / not a whole number of blocks.
+        for invalid in [&[0u8; 16][..], &[0u8; 17][..], &[0u8; 33][..]] {
+            let encoded = base64::engine::general_purpose::STANDARD.encode(invalid);
+            let mapping = bytes_field(1, encoded.as_bytes());
+            let payload = bytes_field(1, &mapping);
+            let mut manifest = section(PAYLOAD_MAGIC, &payload);
+            manifest.extend(section(METADATA_MAGIC, &metadata));
+            assert!(key_looks_valid_bytes(&manifest, &key));
+        }
+
+        // An unreadable path has nothing to test.
+        let dir = tempfile::tempdir().unwrap();
+        assert!(key_looks_valid(&dir.path().join("absent.manifest"), &key));
+
+        let encrypted = encrypted_fixture(b"game/bin/linuxsteamrt64/cs2", &key, &iv);
+        assert!(key_looks_valid_bytes(&encrypted, &[]));
+
+        let path = dir.path().join("730_99.manifest");
+        std::fs::write(&path, &encrypted).unwrap();
+        assert!(key_looks_valid(&path, &key));
+        assert!(!key_looks_valid(&path, &[0x43; 32]));
+    }
+
+    #[test]
+    fn key_check_rejects_control_bytes_after_successful_unpadding() {
+        let key = [0x42; 32];
+        let iv = [0x11; 16];
+        let bytes = encrypted_fixture(b"\x01hidden/name", &key, &iv);
+        assert!(!key_looks_valid_bytes(&bytes, &key));
+    }
+
+    #[test]
+    fn decrypt_encrypted_filename_round_trips_and_rejects_bad_shapes() {
+        let key = [0x42; 32];
+        let iv = [0x11; 16];
+        let name = b"game/bin/linuxsteamrt64/cs2";
+        let ciphertext = encrypt_filename(name, &key, &iv);
+
+        assert_eq!(
+            decrypt_encrypted_filename(&ciphertext, &key).as_deref(),
+            Some(name.as_slice())
+        );
+        assert!(decrypt_encrypted_filename(&ciphertext, &[0x42; 31]).is_none());
+        assert!(decrypt_encrypted_filename(&ciphertext[..16], &key).is_none());
+        assert!(decrypt_encrypted_filename(&ciphertext[..17], &key).is_none());
+        assert!(decrypt_encrypted_filename(&ciphertext, &[0x43; 32]).is_none());
     }
 }

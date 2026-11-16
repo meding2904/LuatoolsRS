@@ -5,7 +5,7 @@ use std::fmt;
 macro_rules! id_type {
     ($(#[$doc:meta])* $name:ident, $inner:ty) => {
         $(#[$doc])*
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
         #[derive(serde::Serialize, serde::Deserialize)]
         #[serde(transparent)]
         #[repr(transparent)]

@@ -27,7 +27,15 @@ tracing-subscriber = { workspace = true }
 eframe = { workspace = true }
 egui = { workspace = true }
 directories = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
+reqwest = { workspace = true, features = ["blocking"] }
+parking_lot = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+zip = { version = "2.6", default-features = false, features = ["deflate"] }
+tokio-util = { workspace = true }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "handshake"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }

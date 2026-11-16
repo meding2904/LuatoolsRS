@@ -1,9 +1,10 @@
-//! `appcache/appinfo.vdf` reading.
+//! `appcache/appinfo.vdf` reading and saving.
 //!
 //! The real file is hundreds of megabytes with roughly 177k app records. This reader keeps
 //! only an `appid -> offset` index plus format-29's shared key string table, and parses one
 //! app record on demand. Parsed records are memoised so [`AppInfoCache::get`] can return a
-//! reference.
+//! reference. [`AppInfoCache::save_as`] streams a new file, copying untouched app records
+//! byte-for-byte and reserializing only the requested replacements.
 //!
 //! File layout (v27/v28/v29):
 //!
@@ -17,15 +18,17 @@
 //! `size` counts metadata + blob, not the 8-byte record header. Metadata is 60 bytes on
 //! v28+ and 40 bytes on v27, which has no binary SHA-1 field.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
-use std::io::{BufReader, Read, Seek, SeekFrom};
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use luatools_core::{AppId, Error, Result};
+use sha1::{Digest, Sha1};
 
 use crate::binary_vdf::{self, Bvdf};
-use crate::launch_options::{LaunchOption, read_launch_options};
+use crate::launch_options::read_launch_options;
+use luatools_core::LaunchOption;
 
 /// appinfo format 27 magic number.
 pub const MAGIC_27: u32 = 0x0756_4427;
@@ -191,6 +194,7 @@ pub struct AppInfoCache {
     meta_length: usize,
     indexed_keys: bool,
     strings: Vec<String>,
+    raw_strings: Vec<Vec<u8>>,
     index: BTreeMap<AppId, IndexEntry>,
     parsed: BTreeMap<AppId, AppInfo>,
 }
@@ -235,6 +239,7 @@ impl AppInfoCache {
         };
 
         let mut strings = Vec::new();
+        let mut raw_strings = Vec::new();
         if indexed_keys {
             let table_offset = read_i64(&mut reader, "appinfo string-table offset")?;
             let table_offset = u64::try_from(table_offset)
@@ -242,7 +247,13 @@ impl AppInfoCache {
             let resume = reader
                 .stream_position()
                 .map_err(|error| Error::io("reading appinfo string-table position", error))?;
-            read_string_table(&mut reader, table_offset, file_length, &mut strings)?;
+            read_string_table(
+                &mut reader,
+                table_offset,
+                file_length,
+                &mut strings,
+                &mut raw_strings,
+            )?;
             reader
                 .seek(SeekFrom::Start(resume))
                 .map_err(|error| Error::io("seeking back to appinfo records", error))?;
@@ -261,6 +272,7 @@ impl AppInfoCache {
             meta_length,
             indexed_keys,
             strings,
+            raw_strings,
             index,
             parsed: BTreeMap::new(),
         })
@@ -294,6 +306,15 @@ impl AppInfoCache {
     #[must_use]
     pub const fn indexed_keys(&self) -> bool {
         self.indexed_keys
+    }
+
+    /// Decoded format-29 string-table entries, in index order.
+    ///
+    /// Entries that were not valid UTF-8 are decoded lossily for display. Saving preserves
+    /// the original raw bytes; use this only for inspection.
+    #[must_use]
+    pub fn strings(&self) -> &[String] {
+        &self.strings
     }
 
     /// Number of apps in the index.
@@ -332,6 +353,303 @@ impl AppInfoCache {
         Ok(self.parsed.get(&app))
     }
 
+    /// Writes a new appinfo file, replacing the blobs of selected apps.
+    ///
+    /// `edits` maps an app id to a complete replacement root table, including the
+    /// `appinfo` wrapper when the source records use one. Apps that are not in `edits` are
+    /// copied from the source byte-for-byte, which keeps duplicate keys, pointer/color
+    /// tags, and non-UTF-8 values exact. Edited apps are reserialized and, on format 28
+    /// and 29, get a fresh `sha1_binary` (SHA-1 of the new blob). `sha1_text` and
+    /// `changeNumber` are copied from the source metadata without modification. Format 27
+    /// has no binary hash field, so its metadata is written unchanged.
+    ///
+    /// On format 29 the original raw string-table entries are preserved verbatim, existing
+    /// keys keep their indices, and keys that only occur in newly written blobs are
+    /// appended in first-use order. Because parsed keys are decoded lossily, an *edited*
+    /// blob whose key bytes were not valid UTF-8 interns the decoded replacement text;
+    /// untouched apps still keep their exact bytes.
+    ///
+    /// Edits for app ids that are not in this file's index are ignored, mirroring the
+    /// source implementation which iterates its index rather than the edit map.
+    ///
+    /// The destination is truncated and written directly. This method does not write a
+    /// temporary file, flush to stable storage, refresh the in-memory index, or replace the
+    /// source; callers must write to a temporary path and rename it into place after
+    /// closing the cache, and should stop Steam before replacing its file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when:
+    ///
+    /// - `destination` resolves to the source file, which would truncate the source while
+    ///   it is still being read;
+    /// - the source has shrunk since it was opened, or an indexed record has a size
+    ///   smaller than its metadata or running past the end of the source;
+    /// - a key or string value in an edited blob contains an interior NUL byte;
+    /// - the string table grows past its `u32` index space;
+    /// - opening, reading, writing, seeking, or serializing fails.
+    pub fn save_as(&mut self, destination: &Path, edits: &HashMap<AppId, Bvdf>) -> Result<()> {
+        self.ensure_distinct_destination(destination)?;
+        self.validate_source_records()?;
+
+        let mut raw_strings = self.raw_strings.clone();
+        let mut lookup: HashMap<String, u32> = HashMap::new();
+        for (index, text) in self.strings.iter().enumerate() {
+            let Ok(index) = u32::try_from(index) else {
+                break;
+            };
+            lookup.entry(text.clone()).or_insert(index);
+        }
+
+        let output = File::create(destination).map_err(|error| {
+            Error::io(
+                format!("creating appinfo destination {}", destination.display()),
+                error,
+            )
+        })?;
+        let mut writer = BufWriter::new(output);
+
+        write_bytes(&mut writer, &self.magic.to_le_bytes(), "appinfo magic")?;
+        write_bytes(
+            &mut writer,
+            &self.universe.to_le_bytes(),
+            "appinfo universe",
+        )?;
+        let table_offset_position = if self.indexed_keys {
+            let position = stream_position(&mut writer, "appinfo string-table offset")?;
+            write_bytes(
+                &mut writer,
+                &[0u8; 8],
+                "appinfo string-table offset placeholder",
+            )?;
+            Some(position)
+        } else {
+            None
+        };
+
+        let mut entries: Vec<(AppId, IndexEntry)> = self
+            .index
+            .iter()
+            .map(|(app_id, entry)| (*app_id, *entry))
+            .collect();
+        entries.sort_unstable_by_key(|(_, entry)| entry.offset);
+
+        for (app_id, entry) in entries {
+            let mut metadata = self.read_record_metadata(app_id, entry)?;
+            if let Some(replacement) = edits.get(&app_id) {
+                let blob = if self.indexed_keys {
+                    binary_vdf::encode_indexed_checked(replacement, |name| {
+                        if let Some(index) = lookup.get(name) {
+                            return Ok(*index);
+                        }
+                        let index = u32::try_from(raw_strings.len()).map_err(|_| {
+                            Error::parse("appinfo", "appinfo string-table index overflow")
+                        })?;
+                        if name.as_bytes().contains(&0) {
+                            return Err(Error::parse(
+                                "appinfo",
+                                "appinfo string-table key contains an interior NUL byte",
+                            ));
+                        }
+                        raw_strings.push(name.as_bytes().to_vec());
+                        lookup.insert(name.to_owned(), index);
+                        Ok(index)
+                    })?
+                } else {
+                    binary_vdf::encode(replacement)?
+                };
+
+                if self.magic >= MAGIC_28 {
+                    let digest = Sha1::digest(&blob);
+                    metadata
+                        .get_mut(SHA1_BINARY_OFFSET..SHA1_BINARY_OFFSET + 20)
+                        .ok_or_else(|| {
+                            Error::parse(
+                                "appinfo",
+                                "record metadata is too short for the binary SHA-1",
+                            )
+                        })?
+                        .copy_from_slice(&digest);
+                }
+                let size = metadata.len().checked_add(blob.len()).ok_or_else(|| {
+                    Error::parse("appinfo", format!("record for app {app_id} is too large"))
+                })?;
+                let size = i32::try_from(size).map_err(|_| {
+                    Error::parse(
+                        "appinfo",
+                        format!("record for app {app_id} does not fit in a 32-bit size"),
+                    )
+                })?;
+
+                write_app_id(&mut writer, app_id, "appinfo record app id")?;
+                write_bytes(&mut writer, &size.to_le_bytes(), "appinfo record size")?;
+                write_bytes(
+                    &mut writer,
+                    &metadata,
+                    &format!("appinfo metadata for app {app_id}"),
+                )?;
+                write_bytes(
+                    &mut writer,
+                    &blob,
+                    &format!("appinfo blob for app {app_id}"),
+                )?;
+            } else {
+                let size = i32::try_from(entry.size).map_err(|_| {
+                    Error::parse(
+                        "appinfo",
+                        format!("record for app {app_id} does not fit in a 32-bit size"),
+                    )
+                })?;
+                write_app_id(&mut writer, app_id, "appinfo record app id")?;
+                write_bytes(&mut writer, &size.to_le_bytes(), "appinfo record size")?;
+                write_bytes(
+                    &mut writer,
+                    &metadata,
+                    &format!("appinfo metadata for app {app_id}"),
+                )?;
+                self.copy_record_blob(app_id, entry, &mut writer)?;
+            }
+        }
+
+        write_bytes(
+            &mut writer,
+            &0i32.to_le_bytes(),
+            "appinfo record terminator",
+        )?;
+
+        if let Some(position) = table_offset_position {
+            let table_offset = stream_position(&mut writer, "appinfo string-table position")?;
+            let count = u32::try_from(raw_strings.len()).map_err(|_| {
+                Error::parse("appinfo", "appinfo string-table count does not fit in u32")
+            })?;
+            write_bytes(
+                &mut writer,
+                &count.to_le_bytes(),
+                "appinfo string-table count",
+            )?;
+            for raw in &raw_strings {
+                write_bytes(&mut writer, raw, "appinfo string-table entry")?;
+                write_bytes(&mut writer, &[0u8], "appinfo string-table terminator")?;
+            }
+
+            let table_offset = i64::try_from(table_offset).map_err(|_| {
+                Error::parse("appinfo", "appinfo string-table offset does not fit in i64")
+            })?;
+            seek_to(&mut writer, position, "appinfo string-table offset field")?;
+            write_bytes(
+                &mut writer,
+                &table_offset.to_le_bytes(),
+                "appinfo string-table offset",
+            )?;
+        }
+
+        writer
+            .flush()
+            .map_err(|error| Error::io("flushing appinfo destination", error))
+    }
+
+    fn ensure_distinct_destination(&self, destination: &Path) -> Result<()> {
+        let canonical_source = self.path.canonicalize().ok();
+        let canonical_destination = destination.canonicalize().ok();
+        let same_canonical = canonical_source
+            .as_deref()
+            .zip(canonical_destination.as_deref())
+            .is_some_and(|(source, destination)| source == destination);
+        if self.path == destination
+            || same_canonical
+            || paths_share_an_inode(&self.path, destination)
+        {
+            return Err(Error::InvalidInput(format!(
+                "refusing to save appinfo over its source file {}",
+                self.path.display()
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_source_records(&self) -> Result<()> {
+        let file_length = self
+            .file
+            .get_ref()
+            .metadata()
+            .map_err(|error| Error::io("reading appinfo source length", error))?
+            .len();
+        for (app_id, entry) in &self.index {
+            if entry.size < self.meta_length {
+                return Err(Error::parse(
+                    "appinfo",
+                    format!(
+                        "record for app {app_id} has size {}, smaller than the {}-byte metadata",
+                        entry.size, self.meta_length
+                    ),
+                ));
+            }
+            let end = entry
+                .offset
+                .checked_add(8)
+                .and_then(|value| value.checked_add(entry.size as u64))
+                .ok_or_else(|| Error::parse("appinfo", "record end offset overflow"))?;
+            if end > file_length {
+                return Err(Error::parse(
+                    "appinfo",
+                    format!(
+                        "record for app {app_id} ends at {end}, past the current source length {file_length}"
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn read_record_metadata(&mut self, app_id: AppId, entry: IndexEntry) -> Result<Vec<u8>> {
+        let meta_offset = entry
+            .offset
+            .checked_add(8)
+            .ok_or_else(|| Error::parse("appinfo", "record metadata offset overflow"))?;
+        self.file
+            .seek(SeekFrom::Start(meta_offset))
+            .map_err(|error| Error::io(format!("seeking to app {app_id} metadata"), error))?;
+        read_exact_vec(
+            &mut self.file,
+            self.meta_length,
+            &format!("appinfo metadata for app {app_id}"),
+        )
+    }
+
+    fn copy_record_blob<W: Write>(
+        &mut self,
+        app_id: AppId,
+        entry: IndexEntry,
+        writer: &mut W,
+    ) -> Result<()> {
+        let blob_length = entry.size.checked_sub(self.meta_length).ok_or_else(|| {
+            Error::parse(
+                "appinfo",
+                format!("record for app {app_id} has no blob after its metadata"),
+            )
+        })?;
+        let blob_offset = entry
+            .offset
+            .checked_add(8)
+            .and_then(|value| value.checked_add(self.meta_length as u64))
+            .ok_or_else(|| Error::parse("appinfo", "record blob offset overflow"))?;
+        self.file
+            .seek(SeekFrom::Start(blob_offset))
+            .map_err(|error| Error::io(format!("seeking to app {app_id} blob"), error))?;
+
+        let expected = u64::try_from(blob_length)
+            .map_err(|_| Error::parse("appinfo", "record blob length does not fit in u64"))?;
+        let copied = std::io::copy(&mut (&mut self.file).take(expected), writer)
+            .map_err(|error| Error::io(format!("copying app {app_id} blob"), error))?;
+        if copied != expected {
+            return Err(Error::parse(
+                "appinfo",
+                format!("appinfo source ended mid-app while copying app {app_id}"),
+            ));
+        }
+        Ok(())
+    }
+
     fn read_app(&mut self, app: AppId, entry: IndexEntry) -> Result<AppInfo> {
         let blob_length = entry.size - self.meta_length;
         let blob_offset = entry
@@ -365,6 +683,7 @@ fn read_string_table(
     offset: u64,
     file_length: u64,
     strings: &mut Vec<String>,
+    raw_strings: &mut Vec<Vec<u8>>,
 ) -> Result<()> {
     if offset < 8 || offset >= file_length {
         return Err(Error::parse(
@@ -404,6 +723,7 @@ fn read_string_table(
         }
         let raw = read_cstring(reader, "appinfo string-table entry")?;
         strings.push(String::from_utf8_lossy(&raw).into_owned());
+        raw_strings.push(raw);
     }
     Ok(())
 }
@@ -544,6 +864,48 @@ fn read_cstring<R: Read>(reader: &mut R, what: &str) -> Result<Vec<u8>> {
         }
         bytes.push(byte[0]);
     }
+}
+
+fn write_bytes<W: Write>(writer: &mut W, bytes: &[u8], what: &str) -> Result<()> {
+    writer
+        .write_all(bytes)
+        .map_err(|error| Error::io(format!("writing {what}"), error))
+}
+
+fn write_app_id<W: Write>(writer: &mut W, value: AppId, what: &str) -> Result<()> {
+    let raw = i32::try_from(value.get())
+        .map_err(|_| Error::parse("appinfo", format!("{what} {value} does not fit in i32")))?;
+    write_bytes(writer, &raw.to_le_bytes(), what)
+}
+
+fn stream_position<W: Seek>(writer: &mut W, what: &str) -> Result<u64> {
+    writer
+        .stream_position()
+        .map_err(|error| Error::io(format!("reading {what}"), error))
+}
+
+fn seek_to<W: Seek>(writer: &mut W, position: u64, what: &str) -> Result<()> {
+    writer
+        .seek(SeekFrom::Start(position))
+        .map_err(|error| Error::io(format!("seeking to {what}"), error))?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn paths_share_an_inode(source: &Path, destination: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    match (std::fs::metadata(source), std::fs::metadata(destination)) {
+        (Ok(source), Ok(destination)) => {
+            source.dev() == destination.dev() && source.ino() == destination.ino()
+        }
+        _ => false,
+    }
+}
+
+#[cfg(not(unix))]
+fn paths_share_an_inode(_source: &Path, _destination: &Path) -> bool {
+    false
 }
 
 #[cfg(test)]
@@ -806,5 +1168,364 @@ mod tests {
         let entry = SteamAppEntry::from_body(AppId::new(730), &body);
         assert_eq!(entry.name, "Counter-Strike 2");
         assert_eq!(entry.app_type, AppType::Game);
+    }
+
+    fn append_indexed_string(output: &mut Vec<u8>, index: u32, value: &[u8]) {
+        output.push(0x01);
+        output.extend_from_slice(&index.to_le_bytes());
+        output.extend_from_slice(value);
+        output.push(0);
+    }
+
+    /// A v29 file whose string table and one property value contain non-UTF-8 bytes,
+    /// whose object has duplicate keys, and which uses pointer and color tags.
+    fn v29_raw_fixture() -> Vec<u8> {
+        let raw_strings: [&[u8]; 6] = [
+            b"appinfo", b"dup", b"legacy", b"\xFDkey", b"pointer", b"color",
+        ];
+
+        let mut blob = Vec::new();
+        blob.push(0x00); // table
+        blob.extend_from_slice(&0u32.to_le_bytes()); // "appinfo"
+        append_indexed_string(&mut blob, 1, b"first");
+        append_indexed_string(&mut blob, 1, b"second");
+        append_indexed_string(&mut blob, 2, &[0x53, 0x74, 0xFD, 0xFE, 0x72]);
+        append_indexed_string(&mut blob, 3, b"value");
+        blob.push(0x04); // pointer
+        blob.extend_from_slice(&4u32.to_le_bytes());
+        blob.extend_from_slice(&77i32.to_le_bytes());
+        blob.push(0x06); // color
+        blob.extend_from_slice(&5u32.to_le_bytes());
+        blob.extend_from_slice(&0x1122_3344i32.to_le_bytes());
+        blob.push(0x08);
+        blob.push(0x08); // root terminator
+
+        let digest = Sha1::digest(&blob);
+        let mut sha1 = [0u8; 20];
+        sha1.copy_from_slice(&digest);
+
+        let mut bytes = MAGIC_29.to_le_bytes().to_vec();
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        let offset_position = bytes.len();
+        bytes.extend_from_slice(&[0u8; 8]);
+        bytes.extend_from_slice(&730i32.to_le_bytes());
+        let size = 60 + blob.len();
+        bytes.extend_from_slice(&(size as i32).to_le_bytes());
+        bytes.extend_from_slice(&metadata(4242, sha1));
+        bytes.extend_from_slice(&blob);
+        bytes.extend_from_slice(&0i32.to_le_bytes());
+
+        let table_offset = bytes.len() as i64;
+        bytes[offset_position..offset_position + 8].copy_from_slice(&table_offset.to_le_bytes());
+        bytes.extend_from_slice(&(raw_strings.len() as u32).to_le_bytes());
+        for string in raw_strings {
+            bytes.extend_from_slice(string);
+            bytes.push(0);
+        }
+        bytes
+    }
+
+    fn edit_arguments(cache: &mut AppInfoCache, app: AppId) -> Bvdf {
+        let mut replacement = cache.get(app).unwrap().unwrap().data.clone();
+        replacement
+            .get_table_mut("appinfo")
+            .unwrap()
+            .push_text("arguments", "-novid");
+        replacement
+    }
+
+    fn v29_record(bytes: &[u8], app_id: i32) -> &[u8] {
+        let mut position = 16usize;
+        loop {
+            let id = i32::from_le_bytes(bytes[position..position + 4].try_into().unwrap());
+            if id == 0 {
+                panic!("app {app_id} is missing from the fixture");
+            }
+            let size = i32::from_le_bytes(bytes[position + 4..position + 8].try_into().unwrap());
+            let size = usize::try_from(size).unwrap();
+            let end = position + 8 + size;
+            if id == app_id {
+                return &bytes[position..end];
+            }
+            position = end;
+        }
+    }
+
+    #[test]
+    fn save_as_without_edits_rebuilds_v29_byte_identically() {
+        let bytes = v29_raw_fixture();
+        let (dir, path) = write_temp(&bytes);
+        let mut cache = AppInfoCache::open(&path).unwrap();
+        assert_eq!(cache.strings().len(), 6);
+        assert_eq!(cache.strings()[3], String::from_utf8_lossy(b"\xFDkey"));
+
+        let destination = dir.path().join("rebuilt.vdf");
+        cache.save_as(&destination, &HashMap::new()).unwrap();
+        assert_eq!(std::fs::read(&destination).unwrap(), bytes);
+    }
+
+    #[test]
+    fn save_as_copies_unedited_v29_apps_byte_for_byte() {
+        let apps = vec![
+            (
+                730,
+                7777,
+                [0xAB; 20],
+                app_body("Counter-Strike 2", "game", "Game.exe"),
+            ),
+            (
+                220,
+                8888,
+                [0xCD; 20],
+                app_body("Half-Life 2", "game", "hl2.exe"),
+            ),
+        ];
+        let bytes = build_v29(&apps, 1);
+        let (dir, path) = write_temp(&bytes);
+        let mut cache = AppInfoCache::open(&path).unwrap();
+        let app = AppId::new(730);
+        let mut edits = HashMap::new();
+        edits.insert(app, edit_arguments(&mut cache, app));
+
+        let destination = dir.path().join("mixed.vdf");
+        cache.save_as(&destination, &edits).unwrap();
+        let output = std::fs::read(&destination).unwrap();
+
+        assert_eq!(
+            v29_record(&output, 220),
+            v29_record(&bytes, 220),
+            "the untouched app must be copied byte-for-byte"
+        );
+        assert_ne!(v29_record(&output, 730), v29_record(&bytes, 730));
+    }
+
+    #[test]
+    fn save_as_edit_restamps_binary_sha1_and_preserves_text_sha1_and_change_number() {
+        let bytes = v29_raw_fixture();
+        let (dir, path) = write_temp(&bytes);
+        let mut cache = AppInfoCache::open(&path).unwrap();
+        let app = AppId::new(730);
+        let replacement = edit_arguments(&mut cache, app);
+
+        let mut edits = HashMap::new();
+        edits.insert(app, replacement);
+        let destination = dir.path().join("edited.vdf");
+        cache.save_as(&destination, &edits).unwrap();
+
+        let output = std::fs::read(&destination).unwrap();
+        // v29 header is 16 bytes, then appid/size, then the 60-byte metadata.
+        let metadata_start = 16 + 8;
+        assert_eq!(
+            &output[metadata_start + 16..metadata_start + 36],
+            b"TEXT-HASH-20-BYTES!!"
+        );
+        assert_eq!(
+            u32::from_le_bytes([
+                output[metadata_start + 36],
+                output[metadata_start + 37],
+                output[metadata_start + 38],
+                output[metadata_start + 39],
+            ]),
+            4242
+        );
+        let size = i32::from_le_bytes([output[20], output[21], output[22], output[23]]);
+        let blob_start = metadata_start + 60;
+        let blob_end = blob_start + usize::try_from(size).unwrap() - 60;
+        let blob = &output[blob_start..blob_end];
+        assert_eq!(
+            &output[metadata_start + 40..metadata_start + 60],
+            Sha1::digest(blob).as_slice()
+        );
+        assert_ne!(
+            &output[metadata_start + 40..metadata_start + 60],
+            [0xAB; 20].as_slice()
+        );
+
+        // The non-UTF-8 value and the non-UTF-8 string-table entry survive the edit.
+        assert!(
+            output
+                .windows(5)
+                .any(|window| window == [0x53, 0x74, 0xFD, 0xFE, 0x72])
+        );
+        assert!(output.windows(5).any(|window| window == b"\xFDkey\0"));
+
+        let table_offset = i64::from_le_bytes(output[8..16].try_into().unwrap());
+        let table_start = usize::try_from(table_offset).unwrap();
+        let count = u32::from_le_bytes(output[table_start..table_start + 4].try_into().unwrap());
+        assert_eq!(count, 7, "the new key is interned at the end");
+
+        // Existing raw table entries, including the non-UTF-8 one, are unchanged and
+        // stay ahead of the appended key.
+        let source_table_offset = i64::from_le_bytes(bytes[8..16].try_into().unwrap());
+        let source_table_start = usize::try_from(source_table_offset).unwrap();
+        assert!(output[table_start + 4..].starts_with(&bytes[source_table_start + 4..]));
+
+        let mut reread = AppInfoCache::open(&destination).unwrap();
+        let app = reread.get(app).unwrap().unwrap();
+        assert_eq!(
+            app.body().unwrap().get_text("arguments").as_deref(),
+            Some("-novid")
+        );
+        assert_eq!(app.change_number, 4242);
+        assert_eq!(
+            app.body()
+                .unwrap()
+                .items()
+                .iter()
+                .filter(|property| property.name == "dup")
+                .count(),
+            2
+        );
+        assert_eq!(
+            app.body().unwrap().find("legacy").unwrap().as_text(),
+            String::from_utf8_lossy(&[0x53, 0x74, 0xFD, 0xFE, 0x72])
+        );
+        assert!(matches!(
+            app.body().unwrap().find("pointer").unwrap().value,
+            BvdfValue::Pointer(77)
+        ));
+        assert!(matches!(
+            app.body().unwrap().find("color").unwrap().value,
+            BvdfValue::Color(0x1122_3344)
+        ));
+    }
+
+    #[test]
+    fn save_as_round_trips_v27_and_v28_and_restamps_only_v28() {
+        for (magic, meta_length) in [(MAGIC_27, 40), (MAGIC_28, 60)] {
+            let apps = vec![(
+                440,
+                123,
+                [0x11; 20],
+                app_body("Team Fortress 2", "game", "hl2.exe"),
+            )];
+            let bytes = build_inline(magic, &apps);
+            let (dir, path) = write_temp(&bytes);
+            let mut cache = AppInfoCache::open(&path).unwrap();
+
+            let untouched = dir.path().join("untouched.vdf");
+            cache.save_as(&untouched, &HashMap::new()).unwrap();
+            assert_eq!(std::fs::read(&untouched).unwrap(), bytes);
+
+            let app = AppId::new(440);
+            let replacement = edit_arguments(&mut cache, app);
+            let mut edits = HashMap::new();
+            edits.insert(app, replacement);
+            let destination = dir.path().join("edited.vdf");
+            cache.save_as(&destination, &edits).unwrap();
+            let output = std::fs::read(&destination).unwrap();
+
+            let metadata_start = 8 + 8;
+            assert_eq!(
+                &output[metadata_start + 16..metadata_start + 36],
+                b"TEXT-HASH-20-BYTES!!"
+            );
+            assert_eq!(
+                u32::from_le_bytes([
+                    output[metadata_start + 36],
+                    output[metadata_start + 37],
+                    output[metadata_start + 38],
+                    output[metadata_start + 39],
+                ]),
+                123
+            );
+            if magic == MAGIC_28 {
+                let size = i32::from_le_bytes([output[12], output[13], output[14], output[15]]);
+                let blob_start = metadata_start + meta_length;
+                let blob_end = blob_start + usize::try_from(size).unwrap() - meta_length;
+                assert_eq!(
+                    &output[metadata_start + 40..metadata_start + 60],
+                    Sha1::digest(&output[blob_start..blob_end]).as_slice()
+                );
+            } else {
+                assert_eq!(
+                    &output[metadata_start..metadata_start + meta_length],
+                    &bytes[metadata_start..metadata_start + meta_length]
+                );
+                assert_eq!(cache.meta_length(), 40);
+            }
+
+            let mut reread = AppInfoCache::open(&destination).unwrap();
+            assert_eq!(
+                reread
+                    .get(app)
+                    .unwrap()
+                    .unwrap()
+                    .body()
+                    .unwrap()
+                    .get_text("arguments")
+                    .as_deref(),
+                Some("-novid")
+            );
+        }
+    }
+
+    #[test]
+    fn save_as_rejects_an_interior_nul_in_a_new_string_table_key() {
+        let bytes = v29_raw_fixture();
+        let (dir, path) = write_temp(&bytes);
+        let mut cache = AppInfoCache::open(&path).unwrap();
+        let app = AppId::new(730);
+        let mut replacement = edit_arguments(&mut cache, app);
+        replacement
+            .get_table_mut("appinfo")
+            .unwrap()
+            .push_text("bad\0key", "value");
+
+        let mut edits = HashMap::new();
+        edits.insert(app, replacement);
+        let error = cache
+            .save_as(&dir.path().join("bad.vdf"), &edits)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("interior NUL"), "{error}");
+    }
+
+    #[test]
+    fn save_as_rejects_the_source_path_and_leaves_it_untouched() {
+        let bytes = v29_raw_fixture();
+        let (_dir, path) = write_temp(&bytes);
+        let mut cache = AppInfoCache::open(&path).unwrap();
+
+        let error = cache
+            .save_as(&path, &HashMap::new())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("source file"), "{error}");
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn save_as_ignores_edits_for_apps_missing_from_the_file() {
+        let bytes = v29_raw_fixture();
+        let (dir, path) = write_temp(&bytes);
+        let mut cache = AppInfoCache::open(&path).unwrap();
+
+        let mut edits = HashMap::new();
+        edits.insert(AppId::new(999), Bvdf::new());
+        let destination = dir.path().join("unchanged.vdf");
+        cache.save_as(&destination, &edits).unwrap();
+        assert_eq!(std::fs::read(&destination).unwrap(), bytes);
+    }
+
+    #[test]
+    fn save_as_rejects_a_source_that_shrank_after_open() {
+        let bytes = v29_raw_fixture();
+        let (dir, path) = write_temp(&bytes);
+        let mut cache = AppInfoCache::open(&path).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(20)
+            .unwrap();
+
+        let destination = dir.path().join("partial.vdf");
+        let error = cache
+            .save_as(&destination, &HashMap::new())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("past the current source length"), "{error}");
+        assert!(!destination.exists());
     }
 }

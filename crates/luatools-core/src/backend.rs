@@ -7,10 +7,14 @@
 use std::path::PathBuf;
 
 use crate::app::{AppDetails, LibrarySnapshot};
+use crate::auth::AuthState;
+use crate::depot::AppDepotInfo;
 use crate::download::{DownloadRequest, DownloadSnapshot};
 use crate::ids::AppId;
 use crate::ids::DownloadId;
+use crate::launch::LaunchOption;
 use crate::settings::Settings;
+use crate::store::{AppMetadata, Featured, StoreSearchItem};
 
 /// Severity of a log line surfaced in the UI console.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -143,6 +147,25 @@ pub enum UpdateState {
     },
 }
 
+/// A destination the interface can navigate to without knowing the page enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum NavTarget {
+    /// Dashboard.
+    Home,
+    /// Store search and featured catalogue.
+    Add,
+    /// Installed and owned library.
+    Builds,
+    /// Download queue.
+    Downloads,
+    /// Per-app management.
+    Manage,
+    /// Application settings.
+    Settings,
+    /// Steam store plugin.
+    Plugin,
+}
+
 /// A request from the UI to the backend.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
@@ -151,6 +174,16 @@ pub enum Command {
     RefreshLibrary,
     /// Load depots, launch options, and manifest state for one app.
     LoadAppDetails(AppId),
+    /// Search the public Steam store.
+    SearchStore(String),
+    /// Load the top-seller and new-release strips.
+    LoadFeatured,
+    /// Load public store metadata for an app that may not be installed.
+    LoadStoreDetails(AppId),
+    /// Resolve depot, branch, and DLC metadata from the public service.
+    LoadDepotInfo(AppId),
+    /// Refresh cached store metadata for one app.
+    RefreshAppMetadata(AppId),
     /// Open a file or directory with the OS handler.
     OpenPath(PathBuf),
     /// Reveal a path in the file manager.
@@ -165,6 +198,13 @@ pub enum Command {
     RestartSteam,
     /// Add a download job.
     EnqueueDownload(Box<DownloadRequest>),
+    /// Queue a plain HTTP(S) file download into the configured download folder.
+    EnqueueUrlDownload {
+        /// Source URL.
+        url: String,
+        /// Optional display name; the response filename is used when omitted.
+        name: Option<String>,
+    },
     /// Temporarily stop a running job.
     PauseDownload(DownloadId),
     /// Resume a paused job.
@@ -185,6 +225,10 @@ pub enum Command {
     CheckForUpdates,
     /// Download and stage the pending update.
     InstallUpdate,
+    /// Open the folder containing a staged update.
+    OpenUpdateFolder,
+    /// Re-read the Steam store plugin's installation status.
+    CheckPluginStatus,
     /// Install or update the Steam store plugin.
     InstallPlugin,
     /// Remove the Steam store plugin.
@@ -196,6 +240,17 @@ pub enum Command {
         /// Options string, empty to clear.
         options: String,
     },
+    /// Write the structured Play-button entries for an app.
+    SaveLaunchEntries {
+        /// Target app.
+        app_id: AppId,
+        /// Entries in display order.
+        entries: Vec<LaunchOption>,
+    },
+    /// Restore Steam's original Play-button entries for an app.
+    RestoreLaunchOptions(AppId),
+    /// Re-apply every staged launch-option edit whose live appinfo changed.
+    ReapplyLaunchOptions,
     /// Enable or disable depots for an app.
     SaveDepotSelection {
         /// Target app.
@@ -203,6 +258,14 @@ pub enum Command {
         /// Depot ids the user enabled.
         enabled: Vec<crate::ids::DepotId>,
     },
+    /// Handle a `luatools://`, Steam, or store URL.
+    HandleProtocolUrl(String),
+    /// Begin the interactive sign-in flow.
+    SignIn,
+    /// Forget the stored session.
+    SignOut,
+    /// Cancel an in-flight sign-in.
+    CancelSignIn,
     /// Open a URL in the default browser.
     OpenUrl(String),
     /// Shut down the application.
@@ -217,6 +280,39 @@ pub enum Event {
     LibraryRefreshed(Box<LibrarySnapshot>),
     /// App details finished loading.
     AppDetailsLoaded(Box<AppDetails>),
+    /// Store metadata for an app that may not be installed.
+    StoreDetailsLoaded(Box<AppDetails>),
+    /// Store search finished.
+    StoreSearchResults {
+        /// Query that produced the result, used to discard stale responses.
+        query: String,
+        /// Matching store entries.
+        items: Vec<StoreSearchItem>,
+    },
+    /// Featured store strips finished loading.
+    FeaturedLoaded(Box<Featured>),
+    /// Cached store metadata for one app changed.
+    AppMetadataLoaded {
+        /// App the metadata belongs to.
+        app_id: AppId,
+        /// Parsed metadata.
+        metadata: Box<AppMetadata>,
+    },
+    /// Depot, branch, and DLC metadata finished loading.
+    DepotInfoLoaded(Box<AppDepotInfo>),
+    /// A cover image was downloaded or discovered on disk.
+    CoverUpdated {
+        /// App the cover belongs to.
+        app_id: AppId,
+        /// Local image path.
+        path: PathBuf,
+    },
+    /// Authentication state changed.
+    AuthState(AuthState),
+    /// The interface should navigate to a destination.
+    Navigate(NavTarget),
+    /// The main window should be shown and focused.
+    ShowWindow,
     /// A download changed state or progressed.
     DownloadUpdated(Box<DownloadSnapshot>),
     /// A download left the queue.
@@ -227,6 +323,8 @@ pub enum Event {
     SettingsSaved(Box<Settings>),
     /// Launch options were written.
     LaunchOptionsSaved(AppId),
+    /// Staged launch edits were overwritten by Steam and differ from the live appinfo.
+    LaunchOptionsDrifted(Vec<AppId>),
     /// Depot selection was written.
     DepotSelectionSaved(AppId),
     /// Update service changed state.

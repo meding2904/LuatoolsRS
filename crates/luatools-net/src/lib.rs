@@ -18,20 +18,29 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod api;
+pub mod appdetails;
+pub mod applist;
 pub mod auth;
+pub mod depot_info;
 pub mod doh;
 pub mod github;
+pub mod hardware;
 pub mod http;
 pub mod plugin;
 pub mod server;
 pub mod update;
 
 pub use api::{ApiClient, AppDetailsRaw, Featured, FeaturedItem, StoreSearchItem};
+pub use appdetails::AppDetailsCache;
+pub use applist::AppListCache;
 pub use auth::{
-    FileSecretStore, Pkce, SecretStore, Session, code_challenge, pkce_pair, try_pkce_pair,
+    AuthClient, AuthConfig, FileSecretStore, Pkce, SecretStore, Session, code_challenge,
+    parse_session, pkce_pair, try_pkce_pair,
 };
+pub use depot_info::SteamDepotInfo;
 pub use doh::DohResolver;
 pub use github::{GithubMirrors, candidates, download};
+pub use hardware::HardwareAppIdService;
 pub use http::{HttpClientConfig, build};
 pub use plugin::{PluginInstaller, UnsupportedPluginInstaller};
 pub use server::{PluginApi, ServerConfig, serve};

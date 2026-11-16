@@ -44,6 +44,14 @@ impl BvdfValue {
         }
     }
 
+    /// Returns the nested object mutably, when this is a table.
+    pub fn as_table_mut(&mut self) -> Option<&mut Bvdf> {
+        match self {
+            Self::Table(table) => Some(table),
+            _ => None,
+        }
+    }
+
     /// Renders the value for display.
     ///
     /// String bytes are decoded lossily, matching the C# `AsText` helper. Tables render as
@@ -93,6 +101,11 @@ impl BvdfProperty {
     #[must_use]
     pub const fn as_table(&self) -> Option<&Bvdf> {
         self.value.as_table()
+    }
+
+    /// Returns the nested object mutably, when the value is a table.
+    pub fn as_table_mut(&mut self) -> Option<&mut Bvdf> {
+        self.value.as_table_mut()
     }
 
     /// Renders the value for display.
@@ -164,10 +177,23 @@ impl Bvdf {
             .find(|property| property.name.eq_ignore_ascii_case(name))
     }
 
+    /// Returns the first property with this name mutably, compared ASCII
+    /// case-insensitively.
+    pub fn find_mut(&mut self, name: &str) -> Option<&mut BvdfProperty> {
+        self.items
+            .iter_mut()
+            .find(|property| property.name.eq_ignore_ascii_case(name))
+    }
+
     /// Returns the first child object with this name.
     #[must_use]
     pub fn get_table(&self, name: &str) -> Option<&Bvdf> {
         self.find(name)?.as_table()
+    }
+
+    /// Returns the first child object with this name mutably.
+    pub fn get_table_mut(&mut self, name: &str) -> Option<&mut Bvdf> {
+        self.find_mut(name)?.as_table_mut()
     }
 
     /// Returns the first value with this name rendered for display.
@@ -246,9 +272,30 @@ where
     Ok(output)
 }
 
+/// Serializes an object with keys replaced by string-table indices from a fallible
+/// interner.
+///
+/// This is [`encode_indexed`] for callers whose string table has a fixed maximum index
+/// or whose new keys must be validated before they are appended.
+///
+/// # Errors
+///
+/// Returns an error when a key or string value contains an interior NUL byte, or when the
+/// interner rejects a key.
+pub fn encode_indexed_checked<F>(value: &Bvdf, mut intern: F) -> Result<Vec<u8>>
+where
+    F: FnMut(&str) -> Result<u32>,
+{
+    let mut output = Vec::new();
+    let mut interner = Interner::IndexedChecked(&mut intern);
+    value.write_table(&mut output, &mut interner)?;
+    Ok(output)
+}
+
 enum Interner<'a> {
     Inline,
     Indexed(&'a mut dyn FnMut(&str) -> u32),
+    IndexedChecked(&'a mut dyn FnMut(&str) -> Result<u32>),
 }
 
 impl Bvdf {
@@ -288,6 +335,9 @@ fn write_key(output: &mut Vec<u8>, interner: &mut Interner<'_>, name: &str) -> R
         Interner::Inline => write_cstring(output, name.as_bytes())?,
         Interner::Indexed(callback) => {
             output.extend_from_slice(&callback(name).to_le_bytes());
+        }
+        Interner::IndexedChecked(callback) => {
+            output.extend_from_slice(&callback(name)?.to_le_bytes());
         }
     }
     Ok(())
@@ -526,5 +576,17 @@ mod tests {
         table.push("k", BvdfValue::String(b"a\0b".to_vec()));
         let error = encode(&table).unwrap_err().to_string();
         assert!(error.contains("interior NUL"), "{error}");
+    }
+
+    #[test]
+    fn fallible_indexed_interner_propagates_its_error() {
+        let mut table = Bvdf::new();
+        table.push_text("rejected", "value");
+        let error = encode_indexed_checked(&table, |_name| {
+            Err(Error::InvalidInput("interner said no".to_owned()))
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("interner said no"), "{error}");
     }
 }
