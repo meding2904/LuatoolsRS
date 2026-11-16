@@ -10,6 +10,9 @@ files — with a GPU-rendered interface built on `egui`/`eframe` (wgpu).
 > generation, third-party manifest-source catalogs, depot-key donation) are deliberately not
 > ported.
 
+The original C# WPF interface and C# backend are mirrored separately at
+<https://github.com/meding2904/LuatoolsCS>.
+
 ## Screenshots
 
 | Home | Depots |
